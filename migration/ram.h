@@ -60,6 +60,8 @@
 #define RAM_SAVE_FLAG_XBZRLE                  0x040
 #define RAM_SAVE_FLAG_HOOK                    0x080
 #define RAM_SAVE_FLAG_MULTIFD_FLUSH           0x200
+#define RAM_SAVE_FLAG_SKIPPED                 0x400
+#define RAM_SAVE_FLAG_SKIP_LIST               0x100
 
 extern XBZRLECacheStats xbzrle_counters;
 
@@ -121,5 +123,8 @@ bool ram_write_tracking_compatible(void);
 void ram_write_tracking_prepare(void);
 int ram_write_tracking_start(void);
 void ram_write_tracking_stop(void);
+
+int collect_list(uint64_t gpa, uint64_t ram_offset);
+void print_collected_list(void);
 
 #endif
