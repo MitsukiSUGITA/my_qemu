@@ -440,6 +440,158 @@ typedef struct RAMState RAMState;
 static RAMState *ram_state;
 
 static NotifierWithReturnList precopy_notifier_list;
+struct init_skip_gpa_list {
+    uint64_t *gpa;      // Guest Physical Address を格納
+    uint64_t *ram_offset;   // RAM内オフセットを格納
+    size_t num;    // 現在のGPA数
+    size_t capacity;   // 配列の容量
+};
+
+struct init_skip_gpa_list skip_gpa_list = {
+    .gpa = NULL,
+    .ram_offset = NULL,
+    .num = 0,
+    .capacity = 0,
+};
+
+
+
+int collect_list(uint64_t gpa, uint64_t ram_offset)
+{
+    int i;
+    uint64_t page_gpa = gpa & TARGET_PAGE_MASK;
+    // 配列の容量が足りなければ拡張する
+    if (skip_gpa_list.num >= skip_gpa_list.capacity) {
+        skip_gpa_list.capacity = (skip_gpa_list.capacity == 0) ? 1024 : skip_gpa_list.capacity * 2;
+        skip_gpa_list.gpa = realloc(skip_gpa_list.gpa, skip_gpa_list.capacity * sizeof(uint64_t));
+        skip_gpa_list.ram_offset = realloc(skip_gpa_list.ram_offset, skip_gpa_list.capacity * sizeof(uint64_t));
+        if (!skip_gpa_list.gpa || !skip_gpa_list.ram_offset) {
+            perror("realloc failed");
+            return -1;
+        }
+    }
+    // 挿入位置 'i' を探す (現在の末尾から逆順にスキャン)
+    for (i = skip_gpa_list.num; i > 0; i--) {
+        if (skip_gpa_list.gpa[i-1] == page_gpa) {
+            // (1): 重複を発見。何もせず即座に終了する
+            return 0; 
+        } else if (skip_gpa_list.gpa[i-1] > page_gpa) {
+            // (2): 挿入位置を空けるため、要素を1つ右にずらす
+            skip_gpa_list.gpa[i] = skip_gpa_list.gpa[i-1];
+            skip_gpa_list.ram_offset[i] = skip_gpa_list.ram_offset[i-1];
+        } else {
+            // list[i-1] < page_gpa なのでlist[i] が正しい挿入位置。ループを抜ける。
+            break;
+        }
+    }
+    // (3): ループで見つけた正しい位置 'i' に新しいGPAを挿入
+    skip_gpa_list.gpa[i] = page_gpa;
+    skip_gpa_list.ram_offset[i] = ram_offset;
+    skip_gpa_list.num++;
+    return 0;
+}
+
+void print_collected_list(void)
+{
+    char *hva;
+    uint64_t read_len = TARGET_PAGE_SIZE; // ページサイズ分読んでみる
+    uint64_t actual_mapped_len = TARGET_PAGE_SIZE;
+    bool is_write_access = false;
+    fprintf(stderr, "gpa\tram_offset\thva\n");
+    for (uint64_t i = 0; i < skip_gpa_list.num; i++) {
+        if(i % 1000 == 0) {
+            fprintf(stderr, "(%zu):", i);
+            fprintf(stderr, " %lx\t", skip_gpa_list.gpa[i]);
+            fprintf(stderr, " %lx\t", skip_gpa_list.ram_offset[i]);
+            hva = cpu_physical_memory_map(skip_gpa_list.gpa[i], &read_len, false);
+            fprintf(stderr, " %p\n", hva);
+            cpu_physical_memory_unmap(hva, actual_mapped_len, is_write_access, actual_mapped_len);
+        }
+    }
+}
+
+// GPAからゲストメモリ内容をダンプする関数
+void dump_guest_memory_from_gpa(uint64_t gpa)
+{
+    uint64_t read_len = TARGET_PAGE_SIZE; // ページサイズ分読んでみる
+    uint64_t actual_mapped_len;
+    bool is_write_access = false;
+    char *hva = cpu_physical_memory_map(gpa, &read_len, false);
+    
+    if (hva) {
+        actual_mapped_len = read_len;
+        printf("           Guest Memory Dump (GPA: %#llx, HVA: %#llx):\n", (unsigned long long)gpa, (unsigned long long)hva);
+        printf("           "); // インデント
+        for (int i = 0; i < actual_mapped_len; i++) {
+            // unsigned charとしてバイトを読み出し、16進数2桁で表示
+            printf("%02x ", (unsigned char)hva[i]);
+            // 32バイトごとに改行
+            if ((i + 1) % 32 == 0) {
+                printf("\n           ");
+            }
+        }
+        printf("\n");
+
+        cpu_physical_memory_unmap(hva, actual_mapped_len, is_write_access, actual_mapped_len);
+    } else {
+        printf("           Failed to map GPA to HVA.\n");
+    }
+}
+
+// ホストポインタからゲストメモリ内容をダンプする関数
+void dump_guest_memory_from_host(uint64_t gpa, void *host_ptr)
+{
+    uint64_t read_len = TARGET_PAGE_SIZE; // ページサイズ分読んでみる
+    uint64_t actual_mapped_len;
+    char *hva = (char *)host_ptr;
+    
+    if (hva) {
+        actual_mapped_len = read_len;
+        printf("           Guest Memory Dump (GPA: %#llx, host: %#llx):\n", (unsigned long long)gpa, (unsigned long long)hva);
+        printf("           "); // インデント
+        for (int i = 0; i < actual_mapped_len; i++) {
+            // unsigned charとしてバイトを読み出し、16進数2桁で表示
+            printf("%02x ", (unsigned char)hva[i]);
+            // 32バイトごとに改行
+            if ((i + 1) % 32 == 0) {
+                printf("\n           ");
+            }
+        }
+        printf("\n");
+
+    } else {
+        printf("           Failed to map GPA to HVA.\n");
+    }
+}
+
+static int compare_gpa(const void *key, const void *elem)
+{
+    uint64_t key_gpa = *(const uint64_t *)key;
+    uint64_t elem_gpa = *(const uint64_t *)elem;
+
+    if (key_gpa < elem_gpa) {
+        return -1;
+    } else if (key_gpa > elem_gpa) {
+        return 1;
+    } else {
+        return 0; // 見つかった
+    }
+}
+
+static bool is_ram_offset_in_skiplist(uint64_t ram_offset)
+{
+    if (skip_gpa_list.num == 0) return false;
+    /* bsearch を使って二分探索を実行 */
+    void *found = bsearch(
+        &ram_offset,     /* 探すキー (void* 型で渡す) */
+        skip_gpa_list.ram_offset,     /* 検索対象の配列 (ソート済み) */
+        skip_gpa_list.num,  /* 配列の要素数 */
+        sizeof(uint64_t),       /* 1要素のバイトサイズ */
+        compare_gpa             /* 比較関数へのポインタ */
+    );
+    /* (5) bsearch は見つかればポインタを、見つからなければNULLを返す */
+    return (found != NULL);
+}
 
 /* Whether postcopy has queued requests? */
 static bool postcopy_has_request(RAMState *rs)
@@ -2242,27 +2394,37 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
 
         /* Check the pages is dirty and if it is send it */
         if (page_dirty) {
-            /*
-             * Properly yield the lock only in postcopy preempt mode
-             * because both migration thread and rp-return thread can
-             * operate on the bitmaps.
-             */
-            if (preempt_active) {
-                qemu_mutex_unlock(&rs->bitmap_mutex);
-            }
-            tmppages = ram_save_target_page(rs, pss);
-            if (tmppages >= 0) {
+            uint64_t offset_in_block = ((ram_addr_t)pss->page << TARGET_PAGE_BITS);     
+            if (is_ram_offset_in_skiplist(offset_in_block)) {
+                // スキップ対象のページだった場合の処理
+                // ダーティビットは既にクリア済み。物理的な転送は行わず、1ページ分「処理した」と見なすため、tmppagesに1をセットする。
+                tmppages = 1; 
                 pages += tmppages;
+                ram_addr_t offset = ((ram_addr_t)pss->page) << TARGET_PAGE_BITS;
+                ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset | RAM_SAVE_FLAG_SKIPPED));
+            } else {
                 /*
-                 * Allow rate limiting to happen in the middle of huge pages if
-                 * something is sent in the current iteration.
+                 * Properly yield the lock only in postcopy preempt mode
+                 * because both migration thread and rp-return thread can
+                 * operate on the bitmaps.
                  */
-                if (pagesize_bits > 1 && tmppages > 0) {
-                    migration_rate_limit();
+                if (preempt_active) {
+                    qemu_mutex_unlock(&rs->bitmap_mutex);
                 }
-            }
-            if (preempt_active) {
-                qemu_mutex_lock(&rs->bitmap_mutex);
+                tmppages = ram_save_target_page(rs, pss);
+                if (tmppages >= 0) {
+                    pages += tmppages;
+                    /*
+                     * Allow rate limiting to happen in the middle of huge pages if
+                     * something is sent in the current iteration.
+                     */
+                    if (pagesize_bits > 1 && tmppages > 0) {
+                        migration_rate_limit();
+                    }
+                }
+                if (preempt_active) {
+                    qemu_mutex_lock(&rs->bitmap_mutex);
+                }
             }
         } else {
             tmppages = 0;
@@ -2462,7 +2624,7 @@ static void ram_bitmaps_destroy(void)
 static void ram_save_cleanup(void *opaque)
 {
     RAMState **rsp = opaque;
-
+    
     /* We don't use dirty log with background snapshots */
     if (!migrate_background_snapshot()) {
         /* caller have hold BQL or is in a bh, so there is
@@ -3201,6 +3363,17 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
         error_setg(errp, "%s: multifd synchronization failed", __func__);
         return ret;
     }
+    if (skip_gpa_list.num > 0) {
+        // 1. リストの「バイト数」と「フラグ」をヘッダとして送信
+        uint64_t list_size_bytes = skip_gpa_list.num * sizeof(uint64_t);
+        qemu_put_be64(f, RAM_SAVE_FLAG_SKIP_LIST);
+        qemu_put_be64(f, list_size_bytes);
+        // 2. リスト本体（ペイロード）を送信
+        qemu_put_buffer(f, (uint8_t *)skip_gpa_list.gpa, list_size_bytes);
+        qemu_put_buffer(f, (uint8_t *)skip_gpa_list.ram_offset, list_size_bytes);
+        // 3. 転送量に加算
+        ram_transferred_add(16 + list_size_bytes * 2);
+    }
 
     qemu_put_be64(f, RAM_SAVE_FLAG_EOS);
     ret = qemu_fflush(f);
@@ -3777,7 +3950,7 @@ static int ram_load_cleanup(void *opaque)
     }
 
     xbzrle_load_cleanup();
-
+    
     RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
         g_free(rb->receivedmap);
         rb->receivedmap = NULL;
@@ -4354,7 +4527,7 @@ static int ram_load_precopy(QEMUFile *f)
         }
 
         if (flags & (RAM_SAVE_FLAG_ZERO | RAM_SAVE_FLAG_PAGE |
-                     RAM_SAVE_FLAG_XBZRLE)) {
+                     RAM_SAVE_FLAG_XBZRLE | RAM_SAVE_FLAG_SKIPPED)) {
             RAMBlock *block = ram_block_from_stream(mis, f, flags,
                                                     RAM_CHANNEL_PRECOPY);
 
@@ -4451,6 +4624,21 @@ static int ram_load_precopy(QEMUFile *f)
             if (ret < 0) {
                 qemu_file_set_error(f, ret);
             }
+            break;
+        case RAM_SAVE_FLAG_SKIP_LIST:
+            // addr にはヘッダからフラグを除いた「バイト数」が入っている
+            uint64_t list_size_bytes = qemu_get_be64(f);
+            // (受信側にグローバル変数 received_skip_list を用意しておき)
+            skip_gpa_list.capacity = list_size_bytes / sizeof(uint64_t);
+            skip_gpa_list.num = skip_gpa_list.capacity;
+            skip_gpa_list.gpa = g_malloc(list_size_bytes);
+            skip_gpa_list.ram_offset = g_malloc(list_size_bytes);
+            // リスト本体を受信
+            qemu_get_buffer(f, (uint8_t *)skip_gpa_list.gpa, list_size_bytes);
+            qemu_get_buffer(f, (uint8_t *)skip_gpa_list.ram_offset, list_size_bytes);
+            break;
+        case RAM_SAVE_FLAG_SKIPPED:
+            memset(host, 0, TARGET_PAGE_SIZE);
             break;
         default:
             error_report("Unknown combination of migration flags: 0x%x", flags);

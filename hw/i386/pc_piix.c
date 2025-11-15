@@ -65,6 +65,8 @@
 #include "hw/uefi/var-service-api.h"
 #include "hw/i386/acpi-build.h"
 #include "target/i386/cpu.h"
+#include "migration/ram.h"
+#include "exec/target_page.h"
 
 #define XEN_IOAPIC_NUM_PIRQS 128ULL
 
@@ -97,6 +99,138 @@ static void piix_intx_routing_notifier_xen(PCIDevice *dev)
         xen_set_pci_link_route(i, v);
     }
 }
+// ゲストからGVAを受け取るためのグローバル変数
+uint64_t data_from_guest = 0;
+
+// コールバック関数：GPAの内容を覗き見る
+static void hypercall_peek_work_fn(CPUState *cpu, run_on_cpu_data data)
+{
+    hwaddr read_len = TARGET_PAGE_SIZE; // ページサイズ分読んでみる
+    hwaddr actual_mapped_len;
+    bool is_write_access = false;
+    char *hva = cpu_physical_memory_map(data_from_guest, &read_len, false);
+    
+    if (hva) {
+        actual_mapped_len = read_len;
+        printf("           Guest Memory Dump (GPA: %#llx):\n", (unsigned long long)data_from_guest);
+        printf("           "); // インデント
+        for (int i = 0; i < actual_mapped_len; i++) {
+            // unsigned charとしてバイトを読み出し、16進数2桁で表示
+            printf("%02x ", (unsigned char)hva[i]);
+            // 32バイトごとに改行
+            if ((i + 1) % 32 == 0) {
+                printf("\n           ");
+            }
+        }
+        printf("\n");
+
+        cpu_physical_memory_unmap(hva, actual_mapped_len, is_write_access, actual_mapped_len);
+    } else {
+        printf("           Failed to map GPA to HVA.\n");
+    }
+}
+
+// アドレス変換と検証を行うコールバック関数
+static void hypercall_work_fn(CPUState *cpu, run_on_cpu_data data)
+{
+    hwaddr gpa = -1; // 失敗時のために初期化
+    
+    // KVMが有効な場合
+    if (kvm_enabled()) {
+        // KVM_TRANSLATE ioctl を使うための構造体を準備
+        struct kvm_translation trans = {
+            .linear_address = data_from_guest,
+        };
+
+        // KVMに直接アドレス変換を依頼する
+        int ret = kvm_vcpu_ioctl(cpu, KVM_TRANSLATE, &trans);
+
+        if (ret == 0 && trans.valid) {
+            // 変換成功！
+            gpa = trans.physical_address;
+        } else {
+            // 変換失敗
+            gpa = -1;
+        }
+    // TCG (KVMなし) の場合
+    } else {
+        hwaddr page_gpa = cpu_get_phys_page_debug(cpu, data_from_guest);
+        if (page_gpa != -1) {
+            gpa = page_gpa | (data_from_guest & ~TARGET_PAGE_BITS);
+        }
+    }
+
+    if (gpa != -1) {
+        //GVA -> GPAの変換が成功したときのページ内容を出力
+        //fprintf(stderr, "GVA: 0x%lx -> GPA: 0x%lx\n", data_from_guest, gpa);
+        data_from_guest = gpa; // 次の処理のためにGPAをセット
+        //hypercall_peek_work_fn(cpu, data);
+        hwaddr page_len = TARGET_PAGE_SIZE;
+        bool is_write = false;
+        void *hva = cpu_physical_memory_map(gpa, &page_len, is_write);
+        if (hva) {
+            ram_addr_t offset_in_block;
+    
+            // (2) HVA から RAMBlock と「ブロック内オフセット」を取得
+            RAMBlock *block = qemu_ram_block_from_host(hva, false, &offset_in_block);
+    
+            if (block) {
+                // (3) ★重要★ GPA (gpa) ではなく、ブロック内オフセットをリストに格納
+                collect_list(gpa, offset_in_block); 
+            }
+            cpu_physical_memory_unmap(hva, page_len, is_write, page_len);
+        } else {
+            fprintf(stderr, "  Failed to map GPA to HVA in hypercall_work_fn(). GPA: 0x%lx\n", gpa);
+        }
+    } else {
+        fprintf(stderr, "  Translation to GPA failed.\n");
+    }
+    //print_collected_list();
+}
+
+static MemTxResult hypercall_peek_trigger_handler(void *opaque, hwaddr addr, uint64_t val,
+                                                  unsigned size, MemTxAttrs attrs)
+{
+    CPUState *cpu = current_cpu;
+    fprintf(stderr, "QEMU: Peek trigger received for GPA 0x%lx.\n", data_from_guest);
+    
+    async_run_on_cpu(cpu, hypercall_peek_work_fn, RUN_ON_CPU_NULL);
+    bql_unlock();
+    qemu_cpu_kick(cpu);
+    bql_lock();
+    return MEMTX_OK;
+}
+
+// データ用ポート (0x1230, 0x1234) のハンドラ
+static MemTxResult hypercall_data_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
+{
+    if (size == 4) { // 32ビット書き込み(outl)のみ受け付ける
+        if (addr == 0) { // low port (0x1230)
+            data_from_guest = (data_from_guest & 0xFFFFFFFF00000000ULL) | (uint32_t)val;
+        } else if (addr == 4) { // high port (0x1234)
+            data_from_guest = (data_from_guest & 0x00000000FFFFFFFFULL) | (val << 32);
+        }
+    }
+    return MEMTX_OK;
+}
+
+// コマンド用ポート (0x1238) のハンドラ
+static MemTxResult hypercall_trigger_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
+{
+    CPUState *cpu = current_cpu;
+    //fprintf(stderr, "QEMU: Trigger received. GVA is 0x%lx. Scheduling work...\n", data_from_guest);
+    
+    async_run_on_cpu(cpu, hypercall_work_fn, RUN_ON_CPU_NULL);
+    bql_unlock();
+    qemu_cpu_kick(cpu);
+    bql_lock();
+    return MEMTX_OK;
+}
+
+// MemoryRegionOpsの定義
+static const MemoryRegionOps data_ops = { .write_with_attrs = hypercall_data_handler, .endianness = DEVICE_LITTLE_ENDIAN };
+static const MemoryRegionOps trigger_ops = { .write_with_attrs = hypercall_trigger_handler, .endianness = DEVICE_LITTLE_ENDIAN };
+static const MemoryRegionOps peek_trigger_ops = { .write_with_attrs = hypercall_peek_trigger_handler, .endianness = DEVICE_LITTLE_ENDIAN };
 
 /* PC hardware initialisation */
 static void pc_init1(MachineState *machine, const char *pci_type)
@@ -296,6 +430,18 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     pc_basic_device_init(pcms, isa_bus, x86ms->gsi, x86ms->rtc,
                          !MACHINE_CLASS(pcmc)->no_floppy, 0x4);
 
+    MemoryRegion *data_mr = g_new(MemoryRegion, 1);
+    memory_region_init_io(data_mr, NULL, &data_ops, NULL, "hypercall-data", 8);
+    memory_region_add_subregion(get_system_io(), 0x1230, data_mr);
+
+    MemoryRegion *trigger_mr = g_new(MemoryRegion, 1);
+    memory_region_init_io(trigger_mr, NULL, &trigger_ops, NULL, "hypercall-trigger", 1);
+    memory_region_add_subregion(get_system_io(), 0x1238, trigger_mr);
+
+    // ★ 覗き見用の新しいトリガーポート (例: 0x1239)
+    MemoryRegion *peek_mr = g_new(MemoryRegion, 1);
+    memory_region_init_io(peek_mr, NULL, &peek_trigger_ops, NULL, "hypercall-peek", 1);
+    memory_region_add_subregion(get_system_io(), 0x1239, peek_mr);
     pc_nic_init(pcmc, isa_bus, pcms->pcibus);
 
     if (piix4_pm) {
