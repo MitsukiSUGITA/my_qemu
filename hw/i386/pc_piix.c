@@ -99,52 +99,47 @@ static void piix_intx_routing_notifier_xen(PCIDevice *dev)
         xen_set_pci_link_route(i, v);
     }
 }
+struct init_skip_gpa_list {
+    uint64_t *gpa;          // Guest Physical Address を格納
+    uint64_t *ram_offset;   // RAM内オフセットを格納
+    size_t num;             // 現在のGPA数
+    size_t capacity;        // 配列の容量
+};
+
+// 構造体インスタンスの外部宣言
+extern struct init_skip_gpa_list skip_gpa_list;
 // ゲストからGVAを受け取るためのグローバル変数
 uint64_t data_from_guest = 0;
+// ゲストからリストの先頭GPAを受け取るための変数（既存のdata_from_guestを流用可能だが、ここでは分離）
+uint64_t mongo_evict_list = 0;
+// MongoDBへの指令フラグ (0:なし, 1:クリア実行せよ)
+extern volatile int mongo_command_flag; 
+// mongoDB内の転送をスキップするキャッシュリスト構造体
+#define BATCH_SIZE 510
+typedef struct {
+    uint64_t count;
+    uint64_t total_pages;
+    uint64_t gpa_list[BATCH_SIZE]; 
+} mongoDB_evict_List;
 
-// コールバック関数：GPAの内容を覗き見る
-static void hypercall_peek_work_fn(CPUState *cpu, run_on_cpu_data data)
-{
-    hwaddr read_len = TARGET_PAGE_SIZE; // ページサイズ分読んでみる
-    hwaddr actual_mapped_len;
-    bool is_write_access = false;
-    char *hva = cpu_physical_memory_map(data_from_guest, &read_len, false);
-    
-    if (hva) {
-        actual_mapped_len = read_len;
-        printf("           Guest Memory Dump (GPA: %#llx):\n", (unsigned long long)data_from_guest);
-        printf("           "); // インデント
-        for (int i = 0; i < actual_mapped_len; i++) {
-            // unsigned charとしてバイトを読み出し、16進数2桁で表示
-            printf("%02x ", (unsigned char)hva[i]);
-            // 32バイトごとに改行
-            if ((i + 1) % 32 == 0) {
-                printf("\n           ");
-            }
-        }
-        printf("\n");
-
-        cpu_physical_memory_unmap(hva, actual_mapped_len, is_write_access, actual_mapped_len);
-    } else {
-        printf("           Failed to map GPA to HVA.\n");
-    }
-}
+// デバッグ用統計カウンター
+static uint64_t debug_total_batches_received = 0; // ハンドラが呼ばれた回数
+static uint64_t debug_total_pages_processed = 0;  // リストから取り出した総ページ数
+static uint64_t debug_mapping_failures = 0;       // GPA -> HVA 変換失敗数
+static uint64_t debug_ramblock_failures = 0;      // HVA -> RAMBlock 変換失敗数
 
 // アドレス変換と検証を行うコールバック関数
 static void hypercall_work_fn(CPUState *cpu, run_on_cpu_data data)
 {
     hwaddr gpa = -1; // 失敗時のために初期化
-    
     // KVMが有効な場合
     if (kvm_enabled()) {
         // KVM_TRANSLATE ioctl を使うための構造体を準備
         struct kvm_translation trans = {
             .linear_address = data_from_guest,
         };
-
         // KVMに直接アドレス変換を依頼する
         int ret = kvm_vcpu_ioctl(cpu, KVM_TRANSLATE, &trans);
-
         if (ret == 0 && trans.valid) {
             // 変換成功！
             gpa = trans.physical_address;
@@ -188,6 +183,194 @@ static void hypercall_work_fn(CPUState *cpu, run_on_cpu_data data)
     //print_collected_list();
 }
 
+// コールバック関数：GPAの内容を覗き見る
+static void hypercall_peek_work_fn(CPUState *cpu, run_on_cpu_data data)
+{
+    hwaddr read_len = TARGET_PAGE_SIZE; // ページサイズ分読んでみる
+    hwaddr actual_mapped_len;
+    bool is_write_access = false;
+    char *hva = cpu_physical_memory_map(data_from_guest, &read_len, false);
+    
+    if (hva) {
+        actual_mapped_len = read_len;
+        printf("           Guest Memory Dump (GPA: %#llx):\n", (unsigned long long)data_from_guest);
+        printf("           "); // インデント
+        for (int i = 0; i < actual_mapped_len; i++) {
+            // unsigned charとしてバイトを読み出し、16進数2桁で表示
+            printf("%02x ", (unsigned char)hva[i]);
+            // 32バイトごとに改行
+            if ((i + 1) % 32 == 0) {
+                printf("\n           ");
+            }
+        }
+        printf("\n");
+
+        cpu_physical_memory_unmap(hva, actual_mapped_len, is_write_access, actual_mapped_len);
+    } else {
+        printf("           Failed to map GPA to HVA.\n");
+    }
+}
+
+// -------------------------------------------------------------
+// ヘルパー関数: 指定されたGPAの中身をダンプする (検証用)
+// -------------------------------------------------------------
+static void dump_gpa_content(hwaddr gpa, int len_to_print)
+{
+    //hwaddr map_len = len_to_print;
+    hwaddr map_len = 4096;
+    bool is_write = false;
+    
+    // GPA -> HVA マッピング
+    char *hva = cpu_physical_memory_map(gpa, &map_len, is_write);
+    
+    if (hva) {
+        printf("[QEMU CHECK] GPA: 0x%lx Content (First %ld bytes):\n", gpa, map_len);
+        printf("          ");
+        
+        for (int i = 0; i < map_len; i++) {
+            printf("%02x ", (unsigned char)hva[i]);
+            if ((i + 1) % 16 == 0) printf("\n          ");
+        }
+        printf("\n");
+        
+        // アンマップ
+        cpu_physical_memory_unmap(hva, map_len, is_write, map_len);
+    } else {
+        printf("[QEMU CHECK] Failed to map GPA: 0x%lx\n", gpa);
+    }
+}
+
+// 【新規】MongoDBからのリストを処理するワーク関数
+static void hypercall_mongo_evict_work_fn(void)
+{
+    // 1. リスト構造体自体のGPAを取得
+    hwaddr list_addr = (hwaddr)mongo_evict_list;
+    hwaddr read_len = sizeof(mongoDB_evict_List);
+    bool is_write = false;
+
+    // 2. リスト構造体をホストメモリ(HVA)にマップ
+    void *hva_list = cpu_physical_memory_map(list_addr, &read_len, is_write);
+    
+    if (hva_list) {
+        mongoDB_evict_List *list_ptr = (mongoDB_evict_List *)hva_list;
+
+        // バッチ受信ログ (100回に1回、または異常時に出力)
+        debug_total_batches_received++;
+        debug_total_pages_processed += list_ptr->count;
+        if (debug_total_batches_received % 100 == 0 || list_ptr->count == 0) {
+            printf("QEMU DEBUG: Batch #%lu received. Count in this batch: %lu. Total pages so far: %lu\n", 
+                   debug_total_batches_received, list_ptr->count, debug_total_pages_processed);
+        }
+        
+        //printf("QEMU: Processing MongoDB Evict List. Count: %lu Total Pages: %lu\n", list_ptr->count, list_ptr->total_pages);
+
+        // ★追加ログ1: リスト構造体の中身をダンプ (最初の5件)
+        /*
+        printf("DEBUG: First 5 GPAs in list:\n");
+        for (int k = 0; k < 5 && k < list_ptr->count; k++) {
+            printf("  [%d] 0x%lx\n", k, list_ptr->gpa_list[k]);
+        }
+        */
+        // 3. リスト内の各GPAについてループ処理
+        for (uint64_t i = 0; i < list_ptr->count && i < 1024; i++) {
+            hwaddr target_gpa = list_ptr->gpa_list[i];
+
+            // ★追加ログ2: ループ内の値確認 (0なら異常)
+            /*
+            if (target_gpa == 0) {
+                printf("DEBUG: Found ZERO GPA at index %lu. list_ptr=%p, gpa_list=%p\n", i, (void*)list_ptr, (void*)list_ptr->gpa_list);
+            }
+            */
+            
+            //ページの内容を出力
+            //if (i <= -10) dump_gpa_content(target_gpa, 32);
+            if (i == -10) dump_gpa_content(target_gpa, 32);
+            //printf("  list count:%lu\ttotal pages:%lu\tGPA:0x%lx\n", list_ptr->count, list_ptr->total_pages, list_ptr->gpa_list[i]);
+
+            // GPAからRAMBlockとオフセットを取得するために、一度そのページをマップする
+            hwaddr page_len = TARGET_PAGE_SIZE;
+            // ★追加: 0アドレスのチェック
+            if (target_gpa == 0) {
+                printf("QEMU WARN: Zero GPA found at index %lu in batch %lu\n", i, debug_total_batches_received);
+                continue;
+            }
+            // GPA -> HVA マッピング
+            void *page_hva = cpu_physical_memory_map(target_gpa, &page_len, false);
+
+            if (page_hva) {
+                ram_addr_t offset_in_block;
+                
+                // HVA -> RAMBlock変換
+                RAMBlock *block = qemu_ram_block_from_host(page_hva, false, &offset_in_block);
+                
+                if (block) {
+                    // ★追加ログ3: collect_list に渡す直前の値
+                    //printf("DEBUG: Calling collect_list(0x%lx, 0x%lx)\n", target_gpa, offset_in_block);
+                    // ★ここで既存の collect_list を再利用してスキップリストに追加
+                    collect_list(target_gpa, offset_in_block);
+                    // ★★★ 実験A: ここをコメントアウトして無効化する ★★★
+                
+                    // 代わりにログだけ出す
+                    // printf("  [CONTROL] Ignoring GPA 0x%lx (No skip)\n", target_gpa);
+                    // デバッグ用出力
+                    //printf("  Added to skip list: GPA 0x%lx (Offset 0x%lx)\n", target_gpa, offset_in_block);
+                } else {
+                    // RAMBlock特定失敗ログ
+                    debug_ramblock_failures++;
+                    if (debug_ramblock_failures % 1000 == 0) { // ログ爆発防止の間引き
+                        printf("QEMU ERROR: Failed to find RAMBlock for GPA 0x%lx (HVA %p). Total failures: %lu\n", 
+                               target_gpa, page_hva, debug_ramblock_failures);
+                    }
+                }
+                
+                // ページのマッピング解除
+                cpu_physical_memory_unmap(page_hva, page_len, false, page_len);
+            } else {
+                // ★追加: GPAマッピング失敗ログ
+                debug_mapping_failures++;
+                if (debug_mapping_failures % 1000 == 0) {
+                    printf("QEMU ERROR: Failed to map GPA 0x%lx to HVA. Total failures: %lu\n", 
+                           target_gpa, debug_mapping_failures);
+                }
+            }
+        }
+        //printf("gpa skip number: %zu\n", skip_gpa_list.num);
+
+
+        // リスト構造体のマッピング解除
+        cpu_physical_memory_unmap(hva_list, read_len, is_write, read_len);
+    } else {
+        fprintf(stderr, "QEMU Error: Failed to map MongoDB Evict List at GPA 0x%lx\n", list_addr);
+    }
+}
+
+// GPA登録データ用ポート (0x1230, 0x1234) のハンドラ
+static MemTxResult hypercall_data_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
+{
+    if (size == 4) { // 32ビット書き込み(outl)のみ受け付ける
+        if (addr == 0) { // low port (0x1230)
+            data_from_guest = (data_from_guest & 0xFFFFFFFF00000000ULL) | (uint32_t)val;
+        } else if (addr == 4) { // high port (0x1234)
+            data_from_guest = (data_from_guest & 0x00000000FFFFFFFFULL) | (val << 32);
+        }
+    }
+    return MEMTX_OK;
+}
+
+// GPA登録コマンド用ポート (0x1238) のハンドラ
+static MemTxResult hypercall_trigger_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
+{
+    CPUState *cpu = current_cpu;
+    //fprintf(stderr, "QEMU: Trigger received. GVA is 0x%lx. Scheduling work...\n", data_from_guest);
+    
+    async_run_on_cpu(cpu, hypercall_work_fn, RUN_ON_CPU_NULL);
+    bql_unlock();
+    qemu_cpu_kick(cpu);
+    bql_lock();
+    return MEMTX_OK;
+}
+
+//  GPAの内容を覗き見る(0x1239) のハンドラ
 static MemTxResult hypercall_peek_trigger_handler(void *opaque, hwaddr addr, uint64_t val,
                                                   unsigned size, MemTxAttrs attrs)
 {
@@ -201,36 +384,61 @@ static MemTxResult hypercall_peek_trigger_handler(void *opaque, hwaddr addr, uin
     return MEMTX_OK;
 }
 
-// データ用ポート (0x1230, 0x1234) のハンドラ
-static MemTxResult hypercall_data_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
+// mongoDBのスキップリストのGPA登録コマンド用ポート (0x1240) のハンドラ
+static MemTxResult hypercall_mongo_evict_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
 {
-    if (size == 4) { // 32ビット書き込み(outl)のみ受け付ける
-        if (addr == 0) { // low port (0x1230)
-            data_from_guest = (data_from_guest & 0xFFFFFFFF00000000ULL) | (uint32_t)val;
-        } else if (addr == 4) { // high port (0x1234)
-            data_from_guest = (data_from_guest & 0x00000000FFFFFFFFULL) | (val << 32);
-        }
-    }
+    //CPUState *cpu = current_cpu;
+    
+    // data_from_guest に入っている値をリストのGPAとして保存
+    mongo_evict_list = data_from_guest;
+    // 非同期実行(async_run_on_cpu)をやめ、直接同期実行する
+    // これにより、この関数が戻るまでゲスト側は次の処理に進めないため、データの上書きを防げる
+    hypercall_mongo_evict_work_fn();
+
+    
+    
+    // 同期実行なので kick も不要だが、念のため残しても害はない
+    //bql_unlock();
+    //qemu_cpu_kick(cpu);
+    //bql_lock();
     return MEMTX_OK;
 }
 
-// コマンド用ポート (0x1238) のハンドラ
-static MemTxResult hypercall_trigger_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
+// 読み込みハンドラ (MongoDB -> QEMU: 命令ありますか？)
+static MemTxResult mongo_cmd_read(void *opaque, hwaddr addr, uint64_t *value, 
+                                  unsigned size, MemTxAttrs attrs)
 {
-    CPUState *cpu = current_cpu;
-    //fprintf(stderr, "QEMU: Trigger received. GVA is 0x%lx. Scheduling work...\n", data_from_guest);
+    // MongoDBが inl(0x1241) した時に呼ばれ、現在のフラグの値を返す
+    /*
+    printf("QEMU: MongoDB queried command flag: %d\n", mongo_command_flag);
+    if(mongo_command_flag == 0) mongo_command_flag = 1;
+    else if(mongo_command_flag == 1) mongo_command_flag = 0;
+    */
+
+    *value = (uint64_t)mongo_command_flag;
     
-    async_run_on_cpu(cpu, hypercall_work_fn, RUN_ON_CPU_NULL);
-    bql_unlock();
-    qemu_cpu_kick(cpu);
-    bql_lock();
-    return MEMTX_OK;
+    return MEMTX_OK; // 成功ステータスを返す
+}
+
+// 書き込みハンドラ (MongoDB -> QEMU: 受け取りました/完了しました)
+static MemTxResult mongo_cmd_write(void *opaque, hwaddr addr, uint64_t value, 
+                                   unsigned size, MemTxAttrs attrs)
+{
+    // MongoDBが outl(0, 0x5004) した時に呼ばれる
+    if (value == 0) {
+        //printf("QEMU: MongoDB acknowledged command. Flag reset.\n");
+        mongo_command_flag = 0;
+    }
+    
+    return MEMTX_OK; // 成功ステータスを返す
 }
 
 // MemoryRegionOpsの定義
 static const MemoryRegionOps data_ops = { .write_with_attrs = hypercall_data_handler, .endianness = DEVICE_LITTLE_ENDIAN };
 static const MemoryRegionOps trigger_ops = { .write_with_attrs = hypercall_trigger_handler, .endianness = DEVICE_LITTLE_ENDIAN };
 static const MemoryRegionOps peek_trigger_ops = { .write_with_attrs = hypercall_peek_trigger_handler, .endianness = DEVICE_LITTLE_ENDIAN };
+static const MemoryRegionOps mongo_evict_ops = { .write_with_attrs = hypercall_mongo_evict_handler, .endianness = DEVICE_LITTLE_ENDIAN };
+static const MemoryRegionOps mongo_cmd_ops = { .read_with_attrs = mongo_cmd_read, .write_with_attrs = mongo_cmd_write, .endianness = DEVICE_LITTLE_ENDIAN };
 
 /* PC hardware initialisation */
 static void pc_init1(MachineState *machine, const char *pci_type)
@@ -430,18 +638,31 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     pc_basic_device_init(pcms, isa_bus, x86ms->gsi, x86ms->rtc,
                          !MACHINE_CLASS(pcmc)->no_floppy, 0x4);
 
+    // アドレス取得用のトリガーポート (0x1230 - 0x1237)
     MemoryRegion *data_mr = g_new(MemoryRegion, 1);
     memory_region_init_io(data_mr, NULL, &data_ops, NULL, "hypercall-data", 8);
     memory_region_add_subregion(get_system_io(), 0x1230, data_mr);
 
+    // GVA -> GPAの変換を行い、スキップリストに追加するトリガーポート (0x1238)
     MemoryRegion *trigger_mr = g_new(MemoryRegion, 1);
     memory_region_init_io(trigger_mr, NULL, &trigger_ops, NULL, "hypercall-trigger", 1);
     memory_region_add_subregion(get_system_io(), 0x1238, trigger_mr);
 
-    // ★ 覗き見用の新しいトリガーポート (例: 0x1239)
+    // ページ覗き見用のトリガーポート (0x1239)
     MemoryRegion *peek_mr = g_new(MemoryRegion, 1);
     memory_region_init_io(peek_mr, NULL, &peek_trigger_ops, NULL, "hypercall-peek", 1);
     memory_region_add_subregion(get_system_io(), 0x1239, peek_mr);
+
+    // mongoDBのスキップリスト作成用のトリガーポート (0x1240)
+    MemoryRegion *mongo_evict_mr = g_new(MemoryRegion, 1);
+    memory_region_init_io(mongo_evict_mr, NULL, &mongo_evict_ops, NULL, "hypercall-mongo-evict", 1);
+    memory_region_add_subregion(get_system_io(), 0x1240, mongo_evict_mr);
+
+    // mongoDBへの指令フラグ用のトリガーポート (0x1241)
+    MemoryRegion *mongo_cmd_mr = g_new(MemoryRegion, 1);
+    memory_region_init_io(mongo_cmd_mr, NULL, &mongo_cmd_ops, NULL, "hypercall-mongo-cmd", 1);
+    memory_region_add_subregion(get_system_io(), 0x1241, mongo_cmd_mr);
+
     pc_nic_init(pcmc, isa_bus, pcms->pcibus);
 
     if (piix4_pm) {

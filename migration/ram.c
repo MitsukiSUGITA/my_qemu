@@ -441,10 +441,10 @@ static RAMState *ram_state;
 
 static NotifierWithReturnList precopy_notifier_list;
 struct init_skip_gpa_list {
-    uint64_t *gpa;      // Guest Physical Address を格納
+    uint64_t *gpa;          // Guest Physical Address を格納
     uint64_t *ram_offset;   // RAM内オフセットを格納
-    size_t num;    // 現在のGPA数
-    size_t capacity;   // 配列の容量
+    size_t num;             // 現在のGPA数
+    size_t capacity;        // 配列の容量
 };
 
 struct init_skip_gpa_list skip_gpa_list = {
@@ -453,13 +453,21 @@ struct init_skip_gpa_list skip_gpa_list = {
     .num = 0,
     .capacity = 0,
 };
+// 実際にスキップされたページ数をカウントする変数
+uint64_t actual_skipped_pages = 0;
 
-
+// MongoDBへの指令フラグ (0:なし, 1:クリア実行せよ)
+volatile int mongo_command_flag = 0;
 
 int collect_list(uint64_t gpa, uint64_t ram_offset)
 {
     int i;
     uint64_t page_gpa = gpa & TARGET_PAGE_MASK;
+
+    // ★ログ1: 関数に入ってきたアドレスを確認
+    // (量が多すぎる場合はコメントアウトしてください)
+    // fprintf(stderr, "DEBUG: collect_list input: gpa=0x%lx -> page=0x%lx\n", gpa, page_gpa);
+
     // 配列の容量が足りなければ拡張する
     if (skip_gpa_list.num >= skip_gpa_list.capacity) {
         skip_gpa_list.capacity = (skip_gpa_list.capacity == 0) ? 1024 : skip_gpa_list.capacity * 2;
@@ -470,6 +478,20 @@ int collect_list(uint64_t gpa, uint64_t ram_offset)
             return -1;
         }
     }
+
+    // 比較・ソート基準を ram_offset に変更
+    for (i = skip_gpa_list.num; i > 0; i--) {
+        if (skip_gpa_list.ram_offset[i-1] == ram_offset) { // ram_offsetで比較
+            return 0; 
+        } else if (skip_gpa_list.ram_offset[i-1] > ram_offset) { // ram_offsetで比較
+            skip_gpa_list.gpa[i] = skip_gpa_list.gpa[i-1];
+            skip_gpa_list.ram_offset[i] = skip_gpa_list.ram_offset[i-1];
+        } else {
+            break;
+        }
+    }
+    
+    /*
     // 挿入位置 'i' を探す (現在の末尾から逆順にスキャン)
     for (i = skip_gpa_list.num; i > 0; i--) {
         if (skip_gpa_list.gpa[i-1] == page_gpa) {
@@ -484,10 +506,16 @@ int collect_list(uint64_t gpa, uint64_t ram_offset)
             break;
         }
     }
+    */
+
     // (3): ループで見つけた正しい位置 'i' に新しいGPAを挿入
     skip_gpa_list.gpa[i] = page_gpa;
     skip_gpa_list.ram_offset[i] = ram_offset;
     skip_gpa_list.num++;
+
+    // ★ログ3: 登録成功
+    // fprintf(stderr, "INSERT: Added 0x%lx. Total count: %zu\n", page_gpa, skip_gpa_list.num);
+
     return 0;
 }
 
@@ -2402,6 +2430,7 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
                 pages += tmppages;
                 ram_addr_t offset = ((ram_addr_t)pss->page) << TARGET_PAGE_BITS;
                 ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset | RAM_SAVE_FLAG_SKIPPED));
+                actual_skipped_pages++;
             } else {
                 /*
                  * Properly yield the lock only in postcopy preempt mode
@@ -3278,6 +3307,44 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
     RAMBlock *block;
     int ret, max_hg_page_size;
 
+    // MongoDB キャッシュクリアのトリガーと同期待機
+    // 1. トリガー発動
+    printf("QEMU Migration: Signaling MongoDB to clear cache...\n");
+    //mongo_command_flag = 1;
+    // 2. 完了待ちループ
+    // 安全のためタイムアウトを設定 (例: 30秒)
+    //int timeout_ms = 30000; 
+    int waited_ms = 0;
+    //int sleep_interval_us = 10000; // 10ms
+
+    printf("QEMU Migration: Waiting for MongoDB response...\n");
+
+    // ★重要: 待機中は BQL (Big QEMU Lock) を手放して、ゲストOSを動かす
+    bql_unlock();
+
+    /*
+    while (mongo_command_flag != 2 && waited_ms < timeout_ms) {
+        // 少し寝てCPUをゲストに譲る
+        g_usleep(sleep_interval_us);
+        waited_ms += (sleep_interval_us / 1000);
+    }
+    */
+
+    // 待機が終わったらロックを取り戻す
+    bql_lock();
+
+    // 3. 結果確認
+    printf("gpa skip number: %zu\n", skip_gpa_list.num);
+    if (mongo_command_flag == 2) {
+        printf("QEMU Migration: MongoDB finished cache clear! (Waited %d ms)\n", waited_ms);
+        printf("gpa skip number: %zu\n", skip_gpa_list.num);
+    } else {
+        printf("QEMU Migration: Timeout waiting for MongoDB! Proceeding anyway...\n");
+        // タイムアウトした場合はフラグを強制リセットしておく
+        mongo_command_flag = 0;
+    }
+    actual_skipped_pages = 0;
+
     /* migration has already setup the bitmap, reuse it. */
     if (!migration_in_colo_state()) {
         if (ram_init_all(rsp, errp) != 0) {
@@ -3363,6 +3430,7 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
         error_setg(errp, "%s: multifd synchronization failed", __func__);
         return ret;
     }
+    /*
     if (skip_gpa_list.num > 0) {
         // 1. リストの「バイト数」と「フラグ」をヘッダとして送信
         uint64_t list_size_bytes = skip_gpa_list.num * sizeof(uint64_t);
@@ -3374,6 +3442,7 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
         // 3. 転送量に加算
         ram_transferred_add(16 + list_size_bytes * 2);
     }
+    */
 
     qemu_put_be64(f, RAM_SAVE_FLAG_EOS);
     ret = qemu_fflush(f);
@@ -3612,6 +3681,16 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
     qemu_put_be64(f, RAM_SAVE_FLAG_EOS);
 
     trace_ram_save_complete(rs->migration_dirty_pages, 1);
+
+    // 【追加】最終結果の出力
+    printf("=========================================\n");
+    printf("Migration Complete Result:\n");
+    printf("  Registered Skip GPAs : %zu pages\n", skip_gpa_list.num);
+    printf("  Actually Skipped     : %lu pages\n", actual_skipped_pages);
+    printf("  Skipped Size         : %lu bytes (%.2f MB)\n", 
+           actual_skipped_pages * TARGET_PAGE_SIZE,
+           (double)(actual_skipped_pages * TARGET_PAGE_SIZE) / (1024 * 1024));
+    printf("=========================================\n");
 
     return qemu_fflush(f);
 }
