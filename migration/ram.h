@@ -124,9 +124,19 @@ void ram_write_tracking_prepare(void);
 int ram_write_tracking_start(void);
 void ram_write_tracking_stop(void);
 
+typedef struct {
+    uint64_t gpa;
+    uint64_t ram_offset;
+} RamSkipItem;
+
+void init_skip_list_mutex(void);
+int collect_list_bulk(RamSkipItem *new_items, size_t new_count);
 int collect_list(uint64_t gpa, uint64_t ram_offset);
 void print_collected_list(void);
 void dump_guest_memory_from_gpa(uint64_t gpa);
 void dump_guest_memory_from_host(uint64_t gpa, void *host_ptr);
+void init_mongo_migration_sync(void);
+extern QemuSemaphore mongo_clear_sem;
+extern volatile int mongo_clear_status;
 
 #endif

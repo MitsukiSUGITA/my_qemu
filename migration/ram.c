@@ -63,6 +63,7 @@
 #include "options.h"
 #include "system/dirtylimit.h"
 #include "system/kvm.h"
+#include "qemu/thread.h" // QemuSemaphore用
 
 #include "hw/boards.h" /* for machine_dump_guest_core() */
 
@@ -459,14 +460,115 @@ uint64_t actual_skipped_pages = 0;
 // MongoDBへの指令フラグ (0:なし, 1:クリア実行せよ)
 volatile int mongo_command_flag = 0;
 
+QemuMutex skip_list_mutex;
+
+// MongoDBキャッシュクリア完了待ち用のセマフォ
+QemuSemaphore mongo_clear_sem;
+// 完了ステータス (0:未完了, 1:完了, 2:タイムアウト/エラー)
+volatile int mongo_clear_status = 0;
+
+/* 初期化関数（ram_init_all または pc_init1 など適切な場所で呼ぶ） */
+void init_mongo_migration_sync(void) {
+    qemu_sem_init(&mongo_clear_sem, 0);
+    mongo_clear_status = 0;
+}
+/* 初期化関数などをどこか（例えば ram_init_all 内など）で呼ぶ必要がありますが、
+   とりあえず静的に初期化するか、pc_piix.cの初期化で呼ぶようにします。 */
+void init_skip_list_mutex(void) {
+    qemu_mutex_init(&skip_list_mutex);
+}
+
+/* * 高速化版: まとめてマージする関数 
+ * new_items: ソート済みの新しいアイテム配列
+ * new_count: その個数
+ */
+int collect_list_bulk(RamSkipItem *new_items, size_t new_count)
+{
+    qemu_mutex_lock(&skip_list_mutex);
+
+    // 1. 容量確保
+    size_t needed_capacity = skip_gpa_list.num + new_count;
+    if (needed_capacity > skip_gpa_list.capacity) {
+        size_t new_cap = (skip_gpa_list.capacity == 0) ? 1024 : skip_gpa_list.capacity;
+        while (new_cap < needed_capacity) new_cap *= 2;
+
+        skip_gpa_list.gpa = realloc(skip_gpa_list.gpa, new_cap * sizeof(uint64_t));
+        skip_gpa_list.ram_offset = realloc(skip_gpa_list.ram_offset, new_cap * sizeof(uint64_t));
+        skip_gpa_list.capacity = new_cap;
+        
+        if (!skip_gpa_list.gpa || !skip_gpa_list.ram_offset) {
+            perror("realloc failed in collect_list_bulk");
+            qemu_mutex_unlock(&skip_list_mutex);
+            return -1;
+        }
+    }
+
+    // マージ作業領域の確保
+    uint64_t *merged_gpa = malloc(skip_gpa_list.capacity * sizeof(uint64_t));
+    uint64_t *merged_offset = malloc(skip_gpa_list.capacity * sizeof(uint64_t));
+    
+    size_t idx_old = 0;
+    size_t idx_new = 0;
+    size_t idx_out = 0;
+
+    // マージループ
+    while (idx_old < skip_gpa_list.num && idx_new < new_count) {
+        uint64_t val_old = skip_gpa_list.ram_offset[idx_old];
+        uint64_t val_new = new_items[idx_new].ram_offset;
+
+        if (val_old < val_new) {
+            merged_offset[idx_out] = val_old;
+            merged_gpa[idx_out]    = skip_gpa_list.gpa[idx_old];
+            idx_old++;
+            idx_out++;
+        } else if (val_old > val_new) {
+            merged_offset[idx_out] = val_new;
+            merged_gpa[idx_out]    = new_items[idx_new].gpa;
+            idx_new++;
+            idx_out++;
+        } else {
+            // 重複時は既存優先
+            merged_offset[idx_out] = val_old;
+            merged_gpa[idx_out]    = skip_gpa_list.gpa[idx_old];
+            idx_old++;
+            idx_new++;
+            idx_out++;
+        }
+    }
+
+    // 残りの既存データをコピー
+    while (idx_old < skip_gpa_list.num) {
+        merged_offset[idx_out] = skip_gpa_list.ram_offset[idx_old];
+        merged_gpa[idx_out]    = skip_gpa_list.gpa[idx_old];
+        idx_old++;
+        idx_out++;
+    }
+
+    // 残りの新規データをコピー
+    while (idx_new < new_count) {
+        merged_offset[idx_out] = new_items[idx_new].ram_offset;
+        merged_gpa[idx_out]    = new_items[idx_new].gpa;
+        idx_new++;
+        idx_out++;
+    }
+
+    // 古いバッファを解放して差し替え
+    free(skip_gpa_list.gpa);
+    free(skip_gpa_list.ram_offset);
+    skip_gpa_list.gpa = merged_gpa;
+    skip_gpa_list.ram_offset = merged_offset;
+    skip_gpa_list.num = idx_out;
+
+    qemu_mutex_unlock(&skip_list_mutex);
+    return 0;
+}
+
 int collect_list(uint64_t gpa, uint64_t ram_offset)
 {
     int i;
     uint64_t page_gpa = gpa & TARGET_PAGE_MASK;
 
-    // ★ログ1: 関数に入ってきたアドレスを確認
-    // (量が多すぎる場合はコメントアウトしてください)
-    // fprintf(stderr, "DEBUG: collect_list input: gpa=0x%lx -> page=0x%lx\n", gpa, page_gpa);
+    qemu_mutex_lock(&skip_list_mutex); // ★ ロック開始
 
     // 配列の容量が足りなければ拡張する
     if (skip_gpa_list.num >= skip_gpa_list.capacity) {
@@ -482,6 +584,7 @@ int collect_list(uint64_t gpa, uint64_t ram_offset)
     // 比較・ソート基準を ram_offset に変更
     for (i = skip_gpa_list.num; i > 0; i--) {
         if (skip_gpa_list.ram_offset[i-1] == ram_offset) { // ram_offsetで比較
+            qemu_mutex_unlock(&skip_list_mutex);
             return 0; 
         } else if (skip_gpa_list.ram_offset[i-1] > ram_offset) { // ram_offsetで比較
             skip_gpa_list.gpa[i] = skip_gpa_list.gpa[i-1];
@@ -490,32 +593,13 @@ int collect_list(uint64_t gpa, uint64_t ram_offset)
             break;
         }
     }
-    
-    /*
-    // 挿入位置 'i' を探す (現在の末尾から逆順にスキャン)
-    for (i = skip_gpa_list.num; i > 0; i--) {
-        if (skip_gpa_list.gpa[i-1] == page_gpa) {
-            // (1): 重複を発見。何もせず即座に終了する
-            return 0; 
-        } else if (skip_gpa_list.gpa[i-1] > page_gpa) {
-            // (2): 挿入位置を空けるため、要素を1つ右にずらす
-            skip_gpa_list.gpa[i] = skip_gpa_list.gpa[i-1];
-            skip_gpa_list.ram_offset[i] = skip_gpa_list.ram_offset[i-1];
-        } else {
-            // list[i-1] < page_gpa なのでlist[i] が正しい挿入位置。ループを抜ける。
-            break;
-        }
-    }
-    */
 
     // (3): ループで見つけた正しい位置 'i' に新しいGPAを挿入
     skip_gpa_list.gpa[i] = page_gpa;
     skip_gpa_list.ram_offset[i] = ram_offset;
     skip_gpa_list.num++;
 
-    // ★ログ3: 登録成功
-    // fprintf(stderr, "INSERT: Added 0x%lx. Total count: %zu\n", page_gpa, skip_gpa_list.num);
-
+    qemu_mutex_unlock(&skip_list_mutex); // ★ ロック解除
     return 0;
 }
 
@@ -608,17 +692,24 @@ static int compare_gpa(const void *key, const void *elem)
 
 static bool is_ram_offset_in_skiplist(uint64_t ram_offset)
 {
+    bool result = false;
+    qemu_mutex_lock(&skip_list_mutex); // ロック取得
+
+    if (skip_gpa_list.num > 0) {   
     if (skip_gpa_list.num == 0) return false;
-    /* bsearch を使って二分探索を実行 */
-    void *found = bsearch(
-        &ram_offset,     /* 探すキー (void* 型で渡す) */
-        skip_gpa_list.ram_offset,     /* 検索対象の配列 (ソート済み) */
-        skip_gpa_list.num,  /* 配列の要素数 */
-        sizeof(uint64_t),       /* 1要素のバイトサイズ */
-        compare_gpa             /* 比較関数へのポインタ */
-    );
-    /* (5) bsearch は見つかればポインタを、見つからなければNULLを返す */
-    return (found != NULL);
+        /* bsearch を使って二分探索を実行 */
+        void *found = bsearch(
+            &ram_offset,     /* 探すキー (void* 型で渡す) */
+            skip_gpa_list.ram_offset,     /* 検索対象の配列 (ソート済み) */
+            skip_gpa_list.num,  /* 配列の要素数 */
+            sizeof(uint64_t),       /* 1要素のバイトサイズ */
+            compare_gpa             /* 比較関数へのポインタ */
+        );
+        result = (found != NULL);
+    }
+
+    qemu_mutex_unlock(&skip_list_mutex); // ロック解除
+    return result;
 }
 
 /* Whether postcopy has queued requests? */
@@ -3307,42 +3398,30 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
     RAMBlock *block;
     int ret, max_hg_page_size;
 
-    // MongoDB キャッシュクリアのトリガーと同期待機
-    // 1. トリガー発動
-    printf("QEMU Migration: Signaling MongoDB to clear cache...\n");
-    //mongo_command_flag = 1;
-    // 2. 完了待ちループ
-    // 安全のためタイムアウトを設定 (例: 30秒)
-    //int timeout_ms = 30000; 
-    int waited_ms = 0;
-    //int sleep_interval_us = 10000; // 10ms
-
-    printf("QEMU Migration: Waiting for MongoDB response...\n");
-
-    // ★重要: 待機中は BQL (Big QEMU Lock) を手放して、ゲストOSを動かす
-    bql_unlock();
-
-    /*
-    while (mongo_command_flag != 2 && waited_ms < timeout_ms) {
-        // 少し寝てCPUをゲストに譲る
-        g_usleep(sleep_interval_us);
-        waited_ms += (sleep_interval_us / 1000);
-    }
+    /* --- 対照実験のため、以下の同期ブロック全体をコメントアウト
     */
+    // 1. トリガー発動 (ゲストへ通知)
+    printf("QEMU Migration: Signaling MongoDB to clear cache...\n");
+    mongo_clear_status = 0;
+    // ゲスト側にポーリングさせているフラグをONにする
+    mongo_command_flag = 1; 
 
-    // 待機が終わったらロックを取り戻す
+    // 2. 完了待ち (無限待機)
+    printf("QEMU Migration: Waiting for MongoDB response (Indefinite wait)...\n");
+    // ★重要: BQLを解除して、ゲストOS(MongoDB)が動けるようにする
+    bql_unlock();
+    // ゲストが完了通知 (sem_post) を送ってくるまで永遠に待機する
+    qemu_sem_wait(&mongo_clear_sem);
+    // 待機が解けたら BQL を取り戻す
     bql_lock();
 
     // 3. 結果確認
-    printf("gpa skip number: %zu\n", skip_gpa_list.num);
-    if (mongo_command_flag == 2) {
-        printf("QEMU Migration: MongoDB finished cache clear! (Waited %d ms)\n", waited_ms);
-        printf("gpa skip number: %zu\n", skip_gpa_list.num);
+    if (mongo_clear_status == 1) {
+        printf("QEMU Migration: MongoDB finished cache clear! Skip list size: %zu\n", skip_gpa_list.num);
     } else {
-        printf("QEMU Migration: Timeout waiting for MongoDB! Proceeding anyway...\n");
-        // タイムアウトした場合はフラグを強制リセットしておく
-        mongo_command_flag = 0;
+        printf("QEMU Migration: MongoDB cache clear finished with unknown status.\n");
     }
+
     actual_skipped_pages = 0;
 
     /* migration has already setup the bitmap, reuse it. */

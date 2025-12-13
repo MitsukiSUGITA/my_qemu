@@ -26,6 +26,7 @@
 #include CONFIG_DEVICES
 
 #include "qemu/units.h"
+#include "qemu/main-loop.h" // BH用
 #include "hw/char/parallel-isa.h"
 #include "hw/i386/x86.h"
 #include "hw/i386/pc.h"
@@ -122,11 +123,38 @@ typedef struct {
     uint64_t gpa_list[BATCH_SIZE]; 
 } mongoDB_evict_List;
 
+/* 作業用キューのアイテム定義 */
+typedef struct EvictWorkItem {
+    mongoDB_evict_List list_data; // ゲストデータのコピー(中身)
+    QSIMPLEQ_ENTRY(EvictWorkItem) next;
+} EvictWorkItem;
+/* 作業用キューのヘッド定義 */
+static QSIMPLEQ_HEAD(, EvictWorkItem) evict_work_queue = 
+    QSIMPLEQ_HEAD_INITIALIZER(evict_work_queue);
+/* キュー操作用のロック */
+static QemuMutex evict_queue_lock;
+static QEMUBH *evict_bh = NULL;
+
+// 比較関数プロトタイプ (static宣言だと見えないので、ここでもstaticで同等のものを作るか、ram.cから公開するかですが、ここでは単純に再定義します)
+static int compare_skip_item_local(const void *a, const void *b) {
+    const RamSkipItem *ia = (const RamSkipItem *)a;
+    const RamSkipItem *ib = (const RamSkipItem *)b;
+    if (ia->ram_offset < ib->ram_offset) return -1;
+    if (ia->ram_offset > ib->ram_offset) return 1;
+    return 0;
+}
+// 非同期でキューに入ったアイテムの総数
+static int async_pending_count;
+// BH処理完了を通知するためのセマフォ
+static QemuSemaphore async_bh_completion_sem;
+
 // デバッグ用統計カウンター
+/*
 static uint64_t debug_total_batches_received = 0; // ハンドラが呼ばれた回数
 static uint64_t debug_total_pages_processed = 0;  // リストから取り出した総ページ数
 static uint64_t debug_mapping_failures = 0;       // GPA -> HVA 変換失敗数
 static uint64_t debug_ramblock_failures = 0;      // HVA -> RAMBlock 変換失敗数
+*/
 
 // アドレス変換と検証を行うコールバック関数
 static void hypercall_work_fn(CPUState *cpu, run_on_cpu_data data)
@@ -211,136 +239,110 @@ static void hypercall_peek_work_fn(CPUState *cpu, run_on_cpu_data data)
     }
 }
 
-// -------------------------------------------------------------
-// ヘルパー関数: 指定されたGPAの中身をダンプする (検証用)
-// -------------------------------------------------------------
-static void dump_gpa_content(hwaddr gpa, int len_to_print)
+/* [Slow Path] Bottom Half 関数
+ * メインループのアイドル時に呼ばれ、溜まったリストを処理する
+ */
+static void evict_processing_bh(void *opaque)
 {
-    //hwaddr map_len = len_to_print;
-    hwaddr map_len = 4096;
-    bool is_write = false;
-    
-    // GPA -> HVA マッピング
-    char *hva = cpu_physical_memory_map(gpa, &map_len, is_write);
-    
-    if (hva) {
-        printf("[QEMU CHECK] GPA: 0x%lx Content (First %ld bytes):\n", gpa, map_len);
-        printf("          ");
-        
-        for (int i = 0; i < map_len; i++) {
-            printf("%02x ", (unsigned char)hva[i]);
-            if ((i + 1) % 16 == 0) printf("\n          ");
+    while (true) {
+        EvictWorkItem *item = NULL;
+
+        qemu_mutex_lock(&evict_queue_lock);
+        if (!QSIMPLEQ_EMPTY(&evict_work_queue)) {
+            item = QSIMPLEQ_FIRST(&evict_work_queue);
+            QSIMPLEQ_REMOVE_HEAD(&evict_work_queue, next);
         }
-        printf("\n");
-        
-        // アンマップ
-        cpu_physical_memory_unmap(hva, map_len, is_write, map_len);
-    } else {
-        printf("[QEMU CHECK] Failed to map GPA: 0x%lx\n", gpa);
-    }
-}
+        qemu_mutex_unlock(&evict_queue_lock);
 
-// 【新規】MongoDBからのリストを処理するワーク関数
-static void hypercall_mongo_evict_work_fn(void)
-{
-    // 1. リスト構造体自体のGPAを取得
-    hwaddr list_addr = (hwaddr)mongo_evict_list;
-    hwaddr read_len = sizeof(mongoDB_evict_List);
-    bool is_write = false;
+        if (!item) break;
 
-    // 2. リスト構造体をホストメモリ(HVA)にマップ
-    void *hva_list = cpu_physical_memory_map(list_addr, &read_len, is_write);
-    
-    if (hva_list) {
-        mongoDB_evict_List *list_ptr = (mongoDB_evict_List *)hva_list;
+        // 1. バッチ内の一時保存用配列
+        RamSkipItem *batch_items = g_new(RamSkipItem, item->list_data.count);
+        size_t valid_count = 0;
 
-        // バッチ受信ログ (100回に1回、または異常時に出力)
-        debug_total_batches_received++;
-        debug_total_pages_processed += list_ptr->count;
-        if (debug_total_batches_received % 100 == 0 || list_ptr->count == 0) {
-            printf("QEMU DEBUG: Batch #%lu received. Count in this batch: %lu. Total pages so far: %lu\n", 
-                   debug_total_batches_received, list_ptr->count, debug_total_pages_processed);
-        }
-        
-        //printf("QEMU: Processing MongoDB Evict List. Count: %lu Total Pages: %lu\n", list_ptr->count, list_ptr->total_pages);
-
-        // ★追加ログ1: リスト構造体の中身をダンプ (最初の5件)
-        /*
-        printf("DEBUG: First 5 GPAs in list:\n");
-        for (int k = 0; k < 5 && k < list_ptr->count; k++) {
-            printf("  [%d] 0x%lx\n", k, list_ptr->gpa_list[k]);
-        }
-        */
-        // 3. リスト内の各GPAについてループ処理
-        for (uint64_t i = 0; i < list_ptr->count && i < 1024; i++) {
-            hwaddr target_gpa = list_ptr->gpa_list[i];
-
-            // ★追加ログ2: ループ内の値確認 (0なら異常)
-            /*
-            if (target_gpa == 0) {
-                printf("DEBUG: Found ZERO GPA at index %lu. list_ptr=%p, gpa_list=%p\n", i, (void*)list_ptr, (void*)list_ptr->gpa_list);
-            }
-            */
+        // 2. まずGPA -> RAMOffsetへの変換をすべて行う
+        for (uint64_t i = 0; i < item->list_data.count; i++) {
+            hwaddr target_gpa = item->list_data.gpa_list[i];
             
-            //ページの内容を出力
-            //if (i <= -10) dump_gpa_content(target_gpa, 32);
-            if (i == -10) dump_gpa_content(target_gpa, 32);
-            //printf("  list count:%lu\ttotal pages:%lu\tGPA:0x%lx\n", list_ptr->count, list_ptr->total_pages, list_ptr->gpa_list[i]);
+            if (target_gpa == 0) continue;
 
-            // GPAからRAMBlockとオフセットを取得するために、一度そのページをマップする
             hwaddr page_len = TARGET_PAGE_SIZE;
-            // ★追加: 0アドレスのチェック
-            if (target_gpa == 0) {
-                printf("QEMU WARN: Zero GPA found at index %lu in batch %lu\n", i, debug_total_batches_received);
-                continue;
-            }
-            // GPA -> HVA マッピング
             void *page_hva = cpu_physical_memory_map(target_gpa, &page_len, false);
-
+            
             if (page_hva) {
                 ram_addr_t offset_in_block;
-                
-                // HVA -> RAMBlock変換
                 RAMBlock *block = qemu_ram_block_from_host(page_hva, false, &offset_in_block);
                 
                 if (block) {
-                    // ★追加ログ3: collect_list に渡す直前の値
-                    //printf("DEBUG: Calling collect_list(0x%lx, 0x%lx)\n", target_gpa, offset_in_block);
-                    // ★ここで既存の collect_list を再利用してスキップリストに追加
-                    collect_list(target_gpa, offset_in_block);
-                    // ★★★ 実験A: ここをコメントアウトして無効化する ★★★
-                
-                    // 代わりにログだけ出す
-                    // printf("  [CONTROL] Ignoring GPA 0x%lx (No skip)\n", target_gpa);
-                    // デバッグ用出力
-                    //printf("  Added to skip list: GPA 0x%lx (Offset 0x%lx)\n", target_gpa, offset_in_block);
-                } else {
-                    // RAMBlock特定失敗ログ
-                    debug_ramblock_failures++;
-                    if (debug_ramblock_failures % 1000 == 0) { // ログ爆発防止の間引き
-                        printf("QEMU ERROR: Failed to find RAMBlock for GPA 0x%lx (HVA %p). Total failures: %lu\n", 
-                               target_gpa, page_hva, debug_ramblock_failures);
-                    }
+                    // ここではリスト登録せず、一時配列に入れるだけ
+                    batch_items[valid_count].gpa = target_gpa;
+                    batch_items[valid_count].ram_offset = offset_in_block;
+                    valid_count++;
                 }
-                
-                // ページのマッピング解除
                 cpu_physical_memory_unmap(page_hva, page_len, false, page_len);
-            } else {
-                // ★追加: GPAマッピング失敗ログ
-                debug_mapping_failures++;
-                if (debug_mapping_failures % 1000 == 0) {
-                    printf("QEMU ERROR: Failed to map GPA 0x%lx to HVA. Total failures: %lu\n", 
-                           target_gpa, debug_mapping_failures);
-                }
             }
         }
-        //printf("gpa skip number: %zu\n", skip_gpa_list.num);
 
+        // 3. バッチ内をソート (O(M log M))
+        if (valid_count > 0) {
+            qsort(batch_items, valid_count, sizeof(RamSkipItem), compare_skip_item_local);
+            // 4. 一括マージ関数を呼び出し (O(N + M))
+            collect_list_bulk(batch_items, valid_count);
+        }
+        g_free(batch_items);
+        g_free(item);
+        // アイテムの処理が完了したことを通知 (セマフォ post)
+        qemu_sem_post(&async_bh_completion_sem);
+    }
+}
 
-        // リスト構造体のマッピング解除
-        cpu_physical_memory_unmap(hva_list, read_len, is_write, read_len);
-    } else {
-        fprintf(stderr, "QEMU Error: Failed to map MongoDB Evict List at GPA 0x%lx\n", list_addr);
+/* [Fast Path] I/Oポートハンドラ (0x1240)
+ * ゲストメモリからコピーだけして即座に戻る
+ */
+static void hypercall_mongo_evict_work_fn_async(void)
+{
+    hwaddr list_addr = (hwaddr)mongo_evict_list;
+    // 作業アイテムを確保
+    EvictWorkItem *item = g_new0(EvictWorkItem, 1);
+    // ★ ゲストメモリからQEMUのローカル構造体へコピー (Deep Copy)
+    cpu_physical_memory_read(list_addr, &item->list_data, sizeof(mongoDB_evict_List));
+
+    // キューに追加
+    qemu_mutex_lock(&evict_queue_lock);
+    QSIMPLEQ_INSERT_TAIL(&evict_work_queue, item, next);
+    qemu_mutex_unlock(&evict_queue_lock);
+
+    // BHをスケジュール (後で実行するように指示)
+    qemu_bh_schedule(evict_bh);
+}
+
+/* 初期化関数 (pc_init1 などで呼ぶ) */
+static void init_evict_async_mechanism(void) {
+    qemu_mutex_init(&evict_queue_lock);
+    // BHを作成。メインスレッドで実行される
+    evict_bh = qemu_bh_new(evict_processing_bh, NULL);
+    // ram.c のロックも初期化
+    init_skip_list_mutex();
+}
+
+/*
+ * [Sync Wait] 非同期処理(BH)が完了するのを待つ関数
+ * vCPUスレッドで実行されます。
+ */
+static void wait_for_evict_bh_completion(void)
+{
+    // 1. QEMUのメインループに実行権を渡し、BHを確実に実行させる
+    qemu_bh_schedule(evict_bh);
+
+    // 2. BHに積まれている全てのアイテム数を取得
+    long count_to_wait = qatomic_xchg(&async_pending_count, 0); 
+    
+    if (count_to_wait > 0) {
+        // 3. アイテムの数だけセマフォを待つ（BQLは自動で解除されます）
+        for (long i = 0; i < count_to_wait; i++) {
+            // qemu_sem_wait は内部で BQL を解除し、待機中にメインループを回します。
+            qemu_sem_wait(&async_bh_completion_sem);
+        }
     }
 }
 
@@ -387,20 +389,13 @@ static MemTxResult hypercall_peek_trigger_handler(void *opaque, hwaddr addr, uin
 // mongoDBのスキップリストのGPA登録コマンド用ポート (0x1240) のハンドラ
 static MemTxResult hypercall_mongo_evict_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
 {
-    //CPUState *cpu = current_cpu;
-    
     // data_from_guest に入っている値をリストのGPAとして保存
     mongo_evict_list = data_from_guest;
-    // 非同期実行(async_run_on_cpu)をやめ、直接同期実行する
-    // これにより、この関数が戻るまでゲスト側は次の処理に進めないため、データの上書きを防げる
-    hypercall_mongo_evict_work_fn();
-
-    
-    
-    // 同期実行なので kick も不要だが、念のため残しても害はない
-    //bql_unlock();
-    //qemu_cpu_kick(cpu);
-    //bql_lock();
+    // 非同期処理待ちのアイテム数をカウントアップ
+    // これにより、同期関数（wait_for_evict_bh_completion）が呼ばれた際に「あと何回セマフォを待てば全ての処理が終わるか」を知ることができます。
+    qatomic_inc(&async_pending_count);
+    // 非同期版を呼ぶ（内部でキュー追加とBHスケジュールが行われる）
+    hypercall_mongo_evict_work_fn_async();
     return MEMTX_OK;
 }
 
@@ -433,12 +428,38 @@ static MemTxResult mongo_cmd_write(void *opaque, hwaddr addr, uint64_t value,
     return MEMTX_OK; // 成功ステータスを返す
 }
 
+/* * 同期ポートハンドラ
+ * ゲストがここに書き込むと、QEMU側の処理完了までブロックします。
+ */
+static MemTxResult hypercall_mongo_evict_sync_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
+{
+    // 値が 1 のときだけ同期を実行
+    if (val == 1) {
+        wait_for_evict_bh_completion();
+    }
+    return MEMTX_OK;
+}
+
+// キャッシュクリア完了通知用ハンドラ (例: ポート 0x1243)
+static MemTxResult hypercall_mongo_evict_sem_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
+{
+    // ゲストから '1' が書き込まれたら完了とみなす
+    if (val == 1) {
+        mongo_clear_status = 1;
+        // 待機中のマイグレーションスレッド (ram_save_setup) を起こす
+        qemu_sem_post(&mongo_clear_sem);
+    }
+    return MEMTX_OK;
+}
+
 // MemoryRegionOpsの定義
 static const MemoryRegionOps data_ops = { .write_with_attrs = hypercall_data_handler, .endianness = DEVICE_LITTLE_ENDIAN };
 static const MemoryRegionOps trigger_ops = { .write_with_attrs = hypercall_trigger_handler, .endianness = DEVICE_LITTLE_ENDIAN };
 static const MemoryRegionOps peek_trigger_ops = { .write_with_attrs = hypercall_peek_trigger_handler, .endianness = DEVICE_LITTLE_ENDIAN };
 static const MemoryRegionOps mongo_evict_ops = { .write_with_attrs = hypercall_mongo_evict_handler, .endianness = DEVICE_LITTLE_ENDIAN };
 static const MemoryRegionOps mongo_cmd_ops = { .read_with_attrs = mongo_cmd_read, .write_with_attrs = mongo_cmd_write, .endianness = DEVICE_LITTLE_ENDIAN };
+static const MemoryRegionOps mongo_sync_ops = { .write_with_attrs = hypercall_mongo_evict_sync_handler, .endianness = DEVICE_LITTLE_ENDIAN };
+static const MemoryRegionOps mongo_sem_ops = { .write_with_attrs = hypercall_mongo_evict_sem_handler, .endianness = DEVICE_LITTLE_ENDIAN };
 
 /* PC hardware initialisation */
 static void pc_init1(MachineState *machine, const char *pci_type)
@@ -638,6 +659,8 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     pc_basic_device_init(pcms, isa_bus, x86ms->gsi, x86ms->rtc,
                          !MACHINE_CLASS(pcmc)->no_floppy, 0x4);
 
+    qemu_sem_init(&async_bh_completion_sem, 0); // 初期値 0
+    qatomic_set(&async_pending_count, 0);
     // アドレス取得用のトリガーポート (0x1230 - 0x1237)
     MemoryRegion *data_mr = g_new(MemoryRegion, 1);
     memory_region_init_io(data_mr, NULL, &data_ops, NULL, "hypercall-data", 8);
@@ -663,8 +686,21 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     memory_region_init_io(mongo_cmd_mr, NULL, &mongo_cmd_ops, NULL, "hypercall-mongo-cmd", 1);
     memory_region_add_subregion(get_system_io(), 0x1241, mongo_cmd_mr);
 
+    // mongoDB同期待機用のポート (0x1242)
+    MemoryRegion *mongo_sync_mr = g_new(MemoryRegion, 1);
+    memory_region_init_io(mongo_sync_mr, NULL, &mongo_sync_ops, NULL, "hypercall-mongo-sync", 1);
+    memory_region_add_subregion(get_system_io(), 0x1242, mongo_sync_mr);
+
+    // mongoDB同期待機用のポート (0x1243)
+    MemoryRegion *mongo_sem_mr = g_new(MemoryRegion, 1);
+    memory_region_init_io(mongo_sem_mr, NULL, &mongo_sem_ops, NULL, "hypercall-mongo-sem", 1);
+    memory_region_add_subregion(get_system_io(), 0x1243, mongo_sem_mr);
+
     pc_nic_init(pcmc, isa_bus, pcms->pcibus);
 
+    // 非同期処理メカニズムの初期化
+    init_evict_async_mechanism();
+    init_mongo_migration_sync();
     if (piix4_pm) {
         smi_irq = qemu_allocate_irq(pc_acpi_smi_interrupt, first_cpu, 0);
 
