@@ -66,6 +66,8 @@
 #include "hw/i386/acpi-build.h"
 #include "target/i386/cpu.h"
 #include "migration/ram.h"
+#include "migration/migration.h"
+#include "exec/target_page.h"
 #include "system/ram_addr.h"
 
 #define XEN_IOAPIC_NUM_PIRQS 128ULL
@@ -331,11 +333,28 @@ static MemTxResult mongo_cmd_read(void *opaque, hwaddr addr, uint64_t *value,
 static MemTxResult mongo_cmd_write(void *opaque, hwaddr addr, uint64_t value, 
                                    unsigned size, MemTxAttrs attrs)
 {
-    // MongoDBが outl(0, 0x1241) した時に呼ばれる
+    // ケース1: フラグのリセット (MongoDBが処理完了を通知: Ack)
     if (value == 0) {
         //printf("QEMU: MongoDB acknowledged command. Flag reset.\n");
         mongo_command_flag = 0;
     }
+    // ケース2: 復元トリガー/問い合わせ (MongoDBがPingを送ってきた: 0xFF)
+    else if (value == 0xFF) {
+        // マイグレーションの着信状態を確認
+        MigrationIncomingState *mis = migration_incoming_get_current();
+
+        // 移送先(Destination)であり、かつ完了済み(COMPLETED)の場合のみ反応する
+        if (mis && mis->state == MIGRATION_STATUS_COMPLETED) {
+            if (mongo_command_flag != 3) {
+                printf("QEMU: Hypercall(0xFF) received & Migration completed. Signaling MongoDB (Flag=3).\n");
+                mongo_command_flag = 3; // 3 = RECONSTRUCT_CACHE
+            }
+        } else {
+            // デバッグ用: 移送元やマイグレーション中でない場合は無視
+            printf("QEMU: Ignored 0xFF trigger. Migration State: %d\n", mis ? mis->state : -1);
+        }
+    }
+    
     return MEMTX_OK; // 成功ステータスを返す
 }
 
