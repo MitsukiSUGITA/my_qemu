@@ -67,6 +67,12 @@
 
 #include "hw/boards.h" /* for machine_dump_guest_core() */
 
+#include <sys/resource.h>
+#include <sys/time.h>
+#include <stdio.h>          // FILE, fopen等に必要
+#include "migration/migration.h" // migrate_get_current() に必要
+#include "migration/misc.h"      // その他のユーティリティ
+
 #if defined(__linux__)
 #include "qemu/userfaultfd.h"
 #endif /* defined(__linux__) */
@@ -457,6 +463,9 @@ struct init_skip_gpa_list skip_gpa_list = {
 // 実際にスキップされたページ数をカウントする変数
 uint64_t actual_skipped_pages = 0;
 
+static unsigned long *global_skip_bitmap = NULL;
+static uint64_t global_bitmap_size = 0;
+
 // MongoDBへの指令フラグ (0:なし, 1:クリア実行せよ)
 volatile int mongo_command_flag = 0;
 
@@ -471,6 +480,18 @@ volatile int mongo_clear_status = 0;
 void init_mongo_migration_sync(void) {
     qemu_sem_init(&mongo_clear_sem, 0);
     mongo_clear_status = 0;
+
+    // ビットマップの初期化
+    if (!global_skip_bitmap) {
+        // 全RAM容量からページ数を計算
+        global_bitmap_size = ram_bytes_total() >> TARGET_PAGE_BITS;
+        global_skip_bitmap = bitmap_new(global_bitmap_size);
+    }
+    // 前回のゴミが残っているかもしれないのでクリア
+    bitmap_zero(global_skip_bitmap, global_bitmap_size);
+    
+    // スキップ数カウンタのリセット
+    actual_skipped_pages = 0;
 }
 /* 初期化関数などをどこか（例えば ram_init_all 内など）で呼ぶ必要がありますが、
    とりあえず静的に初期化するか、pc_piix.cの初期化で呼ぶようにします。 */
@@ -484,80 +505,24 @@ void init_skip_list_mutex(void) {
  */
 int collect_list_bulk(RamSkipItem *new_items, size_t new_count)
 {
+    // ビットマップが未確保ならエラー
+    if (!global_skip_bitmap) return -1;
+
     qemu_mutex_lock(&skip_list_mutex);
 
-    // 1. 容量確保
-    size_t needed_capacity = skip_gpa_list.num + new_count;
-    if (needed_capacity > skip_gpa_list.capacity) {
-        size_t new_cap = (skip_gpa_list.capacity == 0) ? 1024 : skip_gpa_list.capacity;
-        while (new_cap < needed_capacity) new_cap *= 2;
+    for (size_t i = 0; i < new_count; i++) {
+        uint64_t offset = new_items[i].ram_offset;
+        uint64_t page_idx = offset >> TARGET_PAGE_BITS;
 
-        skip_gpa_list.gpa = realloc(skip_gpa_list.gpa, new_cap * sizeof(uint64_t));
-        skip_gpa_list.ram_offset = realloc(skip_gpa_list.ram_offset, new_cap * sizeof(uint64_t));
-        skip_gpa_list.capacity = new_cap;
-        
-        if (!skip_gpa_list.gpa || !skip_gpa_list.ram_offset) {
-            perror("realloc failed in collect_list_bulk");
-            qemu_mutex_unlock(&skip_list_mutex);
-            return -1;
+        // 範囲チェック (安全のため)
+        if (page_idx < global_bitmap_size) {
+            // ビットを立てる (O(1))
+            // 既に立っているかチェックして、初めてならカウントアップしても良い
+            if (!test_and_set_bit(page_idx, global_skip_bitmap)) {
+                // 必要ならここで登録数をカウント
+            }
         }
     }
-
-    // マージ作業領域の確保
-    uint64_t *merged_gpa = malloc(skip_gpa_list.capacity * sizeof(uint64_t));
-    uint64_t *merged_offset = malloc(skip_gpa_list.capacity * sizeof(uint64_t));
-    
-    size_t idx_old = 0;
-    size_t idx_new = 0;
-    size_t idx_out = 0;
-
-    // マージループ
-    while (idx_old < skip_gpa_list.num && idx_new < new_count) {
-        uint64_t val_old = skip_gpa_list.ram_offset[idx_old];
-        uint64_t val_new = new_items[idx_new].ram_offset;
-
-        if (val_old < val_new) {
-            merged_offset[idx_out] = val_old;
-            merged_gpa[idx_out]    = skip_gpa_list.gpa[idx_old];
-            idx_old++;
-            idx_out++;
-        } else if (val_old > val_new) {
-            merged_offset[idx_out] = val_new;
-            merged_gpa[idx_out]    = new_items[idx_new].gpa;
-            idx_new++;
-            idx_out++;
-        } else {
-            // 重複時は既存優先
-            merged_offset[idx_out] = val_old;
-            merged_gpa[idx_out]    = skip_gpa_list.gpa[idx_old];
-            idx_old++;
-            idx_new++;
-            idx_out++;
-        }
-    }
-
-    // 残りの既存データをコピー
-    while (idx_old < skip_gpa_list.num) {
-        merged_offset[idx_out] = skip_gpa_list.ram_offset[idx_old];
-        merged_gpa[idx_out]    = skip_gpa_list.gpa[idx_old];
-        idx_old++;
-        idx_out++;
-    }
-
-    // 残りの新規データをコピー
-    while (idx_new < new_count) {
-        merged_offset[idx_out] = new_items[idx_new].ram_offset;
-        merged_gpa[idx_out]    = new_items[idx_new].gpa;
-        idx_new++;
-        idx_out++;
-    }
-
-    // 古いバッファを解放して差し替え
-    free(skip_gpa_list.gpa);
-    free(skip_gpa_list.ram_offset);
-    skip_gpa_list.gpa = merged_gpa;
-    skip_gpa_list.ram_offset = merged_offset;
-    skip_gpa_list.num = idx_out;
 
     qemu_mutex_unlock(&skip_list_mutex);
     return 0;
@@ -676,40 +641,33 @@ void dump_guest_memory_from_host(uint64_t gpa, void *host_ptr)
     }
 }
 
-static int compare_gpa(const void *key, const void *elem)
-{
-    uint64_t key_gpa = *(const uint64_t *)key;
-    uint64_t elem_gpa = *(const uint64_t *)elem;
-
-    if (key_gpa < elem_gpa) {
-        return -1;
-    } else if (key_gpa > elem_gpa) {
-        return 1;
-    } else {
-        return 0; // 見つかった
-    }
-}
-
 static bool is_ram_offset_in_skiplist(uint64_t ram_offset)
 {
-    bool result = false;
-    qemu_mutex_lock(&skip_list_mutex); // ロック取得
+if (!global_skip_bitmap) return false;
 
-    if (skip_gpa_list.num > 0) {   
-    if (skip_gpa_list.num == 0) return false;
-        /* bsearch を使って二分探索を実行 */
-        void *found = bsearch(
-            &ram_offset,     /* 探すキー (void* 型で渡す) */
-            skip_gpa_list.ram_offset,     /* 検索対象の配列 (ソート済み) */
-            skip_gpa_list.num,  /* 配列の要素数 */
-            sizeof(uint64_t),       /* 1要素のバイトサイズ */
-            compare_gpa             /* 比較関数へのポインタ */
-        );
-        result = (found != NULL);
+    uint64_t page_idx = ram_offset >> TARGET_PAGE_BITS;
+    
+    if (page_idx >= global_bitmap_size) return false;
+
+    // 単純なビットチェック (O(1))
+    // 読み取りだけなのでロックなしでも動作するが、厳密には qemu_mutex_lock(&skip_list_mutex) が推奨される
+    // ただし atomic な bitmap 操作を使っていればロック不要
+    return test_bit(page_idx, global_skip_bitmap);
+}
+
+double cpu_start, cpu_end;
+/* CPU時間（ユーザー + システム）を秒単位(double)で返す関数 */
+static double get_process_cpu_time(void)
+{
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        // User CPU time
+        double u = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0;
+        // System CPU time
+        double s = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0;
+        return u + s;
     }
-
-    qemu_mutex_unlock(&skip_list_mutex); // ロック解除
-    return result;
+    return 0.0;
 }
 
 /* Whether postcopy has queued requests? */
@@ -2495,8 +2453,7 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
 {
     bool page_dirty, preempt_active = postcopy_preempt_active();
     int tmppages, pages = 0;
-    size_t pagesize_bits =
-        qemu_ram_pagesize(pss->block) >> TARGET_PAGE_BITS;
+    size_t pagesize_bits = qemu_ram_pagesize(pss->block) >> TARGET_PAGE_BITS;
     unsigned long start_page = pss->page;
     int res;
 
@@ -3398,6 +3355,7 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
     RAMBlock *block;
     int ret, max_hg_page_size;
 
+    cpu_start = get_process_cpu_time();
     /* --- 対照実験のため、以下の同期ブロック全体をコメントアウト
     */
     // 1. トリガー発動 (ゲストへ通知)
@@ -3761,9 +3719,43 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
 
     trace_ram_save_complete(rs->migration_dirty_pages, 1);
 
-    // 【追加】最終結果の出力
+    cpu_end = get_process_cpu_time();
+    double cpu_time_val = cpu_end - cpu_start;
+
+    // CSV出力処理
+    // 1. 総転送量 (Transferred) の計算
+    double qemu_file_bytes = stat64_get(&mig_stats.qemu_file_transferred);
+    double multifd_bytes   = stat64_get(&mig_stats.multifd_bytes);
+    double rdma_bytes      = stat64_get(&mig_stats.rdma_bytes);
+    double transferred_GB = (qemu_file_bytes + multifd_bytes + rdma_bytes) / (1024 * 1024 * 1024);
+    /* 2. その他の統計情報 */
+    uint64_t normal_pages = stat64_get(&mig_stats.normal_pages);
+    uint64_t dirty_syncs  = stat64_get(&mig_stats.dirty_sync_count);
+    /* 3. 時間情報の取得 */
+    MigrationState *s = migrate_get_current();
+    /* 4. CSVファイル出力 */
+    const char *csv_path = "/home/mitsuki/migration_log.csv";
+    FILE *fp = fopen(csv_path, "a");
+    if (fp) {
+        fseek(fp, 0, SEEK_END);
+        if (ftell(fp) == 0) {
+            // ヘッダー書き込み
+            fprintf(fp, "CPU_Time(sec),Setup_Time(ms),Transferred(GB),Normal_Pages,Dirty_Syncs\n");
+        }
+        fprintf(fp, "%.6f,%" PRId64 ",%.2f,%" PRIu64 ",%" PRIu64 "\n",
+                cpu_time_val,           // 計測したCPU時間変数
+                s->setup_time,          // Setup Time
+                transferred_GB,      // Transferred (計算結果)
+                normal_pages,           // Normal Pages
+                dirty_syncs             // Dirty Syncs
+        );
+        fclose(fp);
+        printf("CSV log saved to %s\n", csv_path);
+    }
+    // 最終結果の出力
     printf("=========================================\n");
     printf("Migration Complete Result:\n");
+    printf("Total Migration CPU Time: %.6f sec\n", cpu_time_val);
     printf("  Registered Skip GPAs : %zu pages\n", skip_gpa_list.num);
     printf("  Actually Skipped     : %lu pages\n", actual_skipped_pages);
     printf("  Skipped Size         : %lu bytes (%.2f MB)\n", 
@@ -4796,7 +4788,6 @@ static int ram_load_precopy(QEMUFile *f)
             qemu_get_buffer(f, (uint8_t *)skip_gpa_list.ram_offset, list_size_bytes);
             break;
         case RAM_SAVE_FLAG_SKIPPED:
-            memset(host, 0, TARGET_PAGE_SIZE);
             break;
         default:
             error_report("Unknown combination of migration flags: 0x%x", flags);
