@@ -26,7 +26,6 @@
 #include CONFIG_DEVICES
 
 #include "qemu/units.h"
-#include "qemu/main-loop.h" // BH用
 #include "hw/char/parallel-isa.h"
 #include "hw/i386/x86.h"
 #include "hw/i386/pc.h"
@@ -67,7 +66,7 @@
 #include "hw/i386/acpi-build.h"
 #include "target/i386/cpu.h"
 #include "migration/ram.h"
-#include "exec/target_page.h"
+#include "system/ram_addr.h"
 
 #define XEN_IOAPIC_NUM_PIRQS 128ULL
 
@@ -100,36 +99,21 @@ static void piix_intx_routing_notifier_xen(PCIDevice *dev)
         xen_set_pci_link_route(i, v);
     }
 }
-struct init_skip_gpa_list {
-    uint64_t *gpa;          // Guest Physical Address を格納
-    uint64_t *ram_offset;   // RAM内オフセットを格納
-    size_t num;             // 現在のGPA数
-    size_t capacity;        // 配列の容量
-};
 
-// 構造体インスタンスの外部宣言
-extern struct init_skip_gpa_list skip_gpa_list;
-// ゲストからGVAを受け取るためのグローバル変数
-uint64_t data_from_guest = 0;
-// ゲストからリストの先頭GPAを受け取るための変数（既存のdata_from_guestを流用可能だが、ここでは分離）
-uint64_t mongo_evict_list = 0;
-// MongoDBへの指令フラグ (0:なし, 1:クリア実行せよ)
-extern volatile int mongo_command_flag; 
-// mongoDB内の転送をスキップするキャッシュリスト構造体
-#define BATCH_SIZE 510
-// L1: データ本体 (4KB)
+uint64_t mongo_evict_list = 0; // ゲストからリストの先頭GPAを受け取るための変数
+extern volatile int mongo_command_flag; // MongoDBへの指令フラグ (0:なし, 1:クリア実行せよ)
+
+// ツリー構造の末端となるデータバッチ
 typedef struct {
-    uint64_t count;
-    uint64_t total_pages;
-    uint64_t gpa_list[BATCH_SIZE];
-} mongoDB_evict_List;
-
-// L3: ルート目次 (4KB)
+    uint64_t entry_count; // このバッチに登録されているスキップ対象ページの総数
+    uint64_t target_gpas[510];      // スキップ対象ページのGPAリスト (1ページに510エントリまで格納可能)
+} SkipListLeaf;
+// 転送スキップ対象を管理するツリー構造の最上位ノード
 typedef struct {
     uint64_t magic;
-    uint64_t total_batches;
-    uint64_t l2_index_gpas[510]; // L2ページ(中間目次)へのGPAリスト
-} EvictRootDirectory;
+    uint64_t mid_entry_count;     // 登録されている中間目次の総数
+    uint64_t mid_level_gpas[510]; // 次の階層(中間目次)へのGPA配列
+} SkipListRoot;
 
 /* 作業用キューのアイテム定義 */
 typedef struct EvictWorkItem {
@@ -143,112 +127,20 @@ static QSIMPLEQ_HEAD(, EvictWorkItem) evict_work_queue =
 static QemuMutex evict_queue_lock;
 static QEMUBH *evict_bh = NULL;
 
-// 比較関数プロトタイプ (static宣言だと見えないので、ここでもstaticで同等のものを作るか、ram.cから公開するかですが、ここでは単純に再定義します)
-static int compare_skip_item_local(const void *a, const void *b) {
-    const RamSkipItem *ia = (const RamSkipItem *)a;
-    const RamSkipItem *ib = (const RamSkipItem *)b;
-    if (ia->ram_offset < ib->ram_offset) return -1;
-    if (ia->ram_offset > ib->ram_offset) return 1;
-    return 0;
-}
-// 非同期でキューに入ったアイテムの総数
-static int async_pending_count;
-// BH処理完了を通知するためのセマフォ
-static QemuSemaphore async_bh_completion_sem;
+static int async_pending_count; // 非同期でキューに入ったアイテムの総数
+static QemuSemaphore async_bh_completion_sem; // BH処理完了を通知するためのセマフォ
 
-// デバッグ用統計カウンター
-/*
-static uint64_t debug_total_batches_received = 0; // ハンドラが呼ばれた回数
-static uint64_t debug_total_pages_processed = 0;  // リストから取り出した総ページ数
-static uint64_t debug_mapping_failures = 0;       // GPA -> HVA 変換失敗数
-static uint64_t debug_ramblock_failures = 0;      // HVA -> RAMBlock 変換失敗数
-*/
-
-// 時間計測マクロ
-static uint64_t diff_ns(struct timespec s, struct timespec e) {
-    return (uint64_t)((e.tv_sec - s.tv_sec) * 1000000000ULL + (e.tv_nsec - s.tv_nsec));
-}
-
-#define TIMER_START(ts) clock_gettime(CLOCK_MONOTONIC, &ts)
-#define TIMER_END(ts) clock_gettime(CLOCK_MONOTONIC, &ts)
-#define TIMER_ADD(acc, s, e) acc += diff_ns(s, e)
-
-uint64_t time_fast_path = 0;   // I/Oハンドラの滞在時間
-uint64_t time_bh_total = 0;    // BH全体の処理時間
-uint64_t time_bh_read_dir = 0; // 目次(L2/L3)の読み込み時間
-uint64_t time_bh_process = 0;  // L1バッチ処理(Read+Map)の時間
-uint64_t total_batches_processed = 0; // 処理したバッチ数
-
-// アドレス変換と検証を行うコールバック関数
-static void hypercall_work_fn(CPUState *cpu, run_on_cpu_data data)
-{
-    hwaddr gpa = -1; // 失敗時のために初期化
-    // KVMが有効な場合
-    if (kvm_enabled()) {
-        // KVM_TRANSLATE ioctl を使うための構造体を準備
-        struct kvm_translation trans = {
-            .linear_address = data_from_guest,
-        };
-        // KVMに直接アドレス変換を依頼する
-        int ret = kvm_vcpu_ioctl(cpu, KVM_TRANSLATE, &trans);
-        if (ret == 0 && trans.valid) {
-            // 変換成功！
-            gpa = trans.physical_address;
-        } else {
-            // 変換失敗
-            gpa = -1;
-        }
-    // TCG (KVMなし) の場合
-    } else {
-        hwaddr page_gpa = cpu_get_phys_page_debug(cpu, data_from_guest);
-        if (page_gpa != -1) {
-            gpa = page_gpa | (data_from_guest & ~TARGET_PAGE_BITS);
-        }
-    }
-
-    if (gpa != -1) {
-        //GVA -> GPAの変換が成功したときのページ内容を出力
-        //fprintf(stderr, "GVA: 0x%lx -> GPA: 0x%lx\n", data_from_guest, gpa);
-        data_from_guest = gpa; // 次の処理のためにGPAをセット
-        //hypercall_peek_work_fn(cpu, data);
-        hwaddr page_len = TARGET_PAGE_SIZE;
-        bool is_write = false;
-        void *hva = cpu_physical_memory_map(gpa, &page_len, is_write);
-        if (hva) {
-            if (gpa < 0x100000) {
-            cpu_physical_memory_unmap(hva, page_len, is_write, page_len);
-            return; 
-        }
-            ram_addr_t offset_in_block;
-    
-            // (2) HVA から RAMBlock と「ブロック内オフセット」を取得
-            RAMBlock *block = qemu_ram_block_from_host(hva, false, &offset_in_block);
-    
-            if (block) {
-                // (3) ★重要★ GPA (gpa) ではなく、ブロック内オフセットをリストに格納
-                collect_list(gpa, offset_in_block); 
-            }
-            cpu_physical_memory_unmap(hva, page_len, is_write, page_len);
-        } else {
-            fprintf(stderr, "  Failed to map GPA to HVA in hypercall_work_fn(). GPA: 0x%lx\n", gpa);
-        }
-    } else {
-        fprintf(stderr, "  Translation to GPA failed.\n");
-    }
-    //print_collected_list();
-}
-
-// コールバック関数：GPAの内容を覗き見る
-static void hypercall_peek_work_fn(CPUState *cpu, run_on_cpu_data data)
+// GPAの内容を覗き見る(現在は使用していないが，今後のデバッグ用に残しておく)
+static void __attribute__((unused)) hypercall_peek_work_fn(CPUState *cpu, run_on_cpu_data data)
 {
     hwaddr read_len = TARGET_PAGE_SIZE; // ページサイズ分読んでみる
     hwaddr actual_mapped_len;
     bool is_write_access = false;
-    char *hva = cpu_physical_memory_map(data_from_guest, &read_len, false);
+    char *hva = cpu_physical_memory_map(mongo_evict_list, &read_len, false);
     
     if (hva) {
         actual_mapped_len = read_len;
-        printf("           Guest Memory Dump (GPA: %#llx):\n", (unsigned long long)data_from_guest);
+        printf("           Guest Memory Dump (GPA: %#llx):\n", (unsigned long long)mongo_evict_list);
         printf("           "); // インデント
         for (int i = 0; i < actual_mapped_len; i++) {
             // unsigned charとしてバイトを読み出し、16進数2桁で表示
@@ -266,142 +158,99 @@ static void hypercall_peek_work_fn(CPUState *cpu, run_on_cpu_data data)
     }
 }
 
-/* * ヘルパー関数: 1つのL1バッチ(510件)を処理する
- * メモリマップ -> リスト追加 -> マージ までを行う
+/*
+ * [第3層] 末端データ(Leaf)からのビットマップ一括更新
+ * 第2層から渡された末端バッチのGPAを読み込み，
+ * 個々のページに対してGPA->HVA-> RAMOffset の変換を行う．
+ * "pc.ram" (メインメモリ) のみを抽出してスタック配列へ保存した後，
+ * 一括でビットマップを更新する．
  */
-static void process_single_l1_batch(hwaddr batch_gpa)
+static void process_register_leaf_batch(hwaddr batch_gpa)
 {
-    mongoDB_evict_List list_data;
-    // L1バッチ構造体を読み込み
+    SkipListLeaf list_data;
     cpu_physical_memory_read(batch_gpa, &list_data, sizeof(list_data));
 
-    if (list_data.count == 0) return;
+    if (list_data.entry_count == 0 || list_data.entry_count > 512) return; // 安全のため件数チェック (1ページに入る最大件数は512)
 
-    // 一時保存用配列 (g_new で確保)
-    RamSkipItem *batch_items = g_new(RamSkipItem, list_data.count);
+    RamSkipItem batch_items[512];
     size_t valid_count = 0;
+    hwaddr len = TARGET_PAGE_SIZE;
 
-    for (uint64_t i = 0; i < list_data.count; i++) {
-        hwaddr target_gpa = list_data.gpa_list[i];
-        if (target_gpa == 0) continue;
+    for (uint64_t i = 0; i < list_data.entry_count; i++) {
+        hwaddr target_gpa = list_data.target_gpas[i];
+        if (!target_gpa) continue; // 0ならスキップ (早期リターン)
 
         // GPA -> HVA -> RAMOffset 変換
-        hwaddr page_len = TARGET_PAGE_SIZE;
-        void *page_hva = cpu_physical_memory_map(target_gpa, &page_len, false);
-        
-        if (page_hva) {
-            ram_addr_t offset_in_block;
-            RAMBlock *block = qemu_ram_block_from_host(page_hva, false, &offset_in_block);
-            
-            if (block) {
-                batch_items[valid_count].gpa = target_gpa;
-                batch_items[valid_count].ram_offset = offset_in_block;
-                valid_count++;
-            }
-            cpu_physical_memory_unmap(page_hva, page_len, false, page_len);
+        void *hva = cpu_physical_memory_map(target_gpa, &len, false); // GPA -> HVA 変換
+        if (!hva) continue;
+        ram_addr_t offset;
+        RAMBlock *block = qemu_ram_block_from_host(hva, false, &offset); // HVA -> RAMOffset 変換
+
+        // メインメモリのみを対象とし、構造体リテラルで一時配列へ格納
+        if (block && strcmp(block->idstr, "pc.ram") == 0) {
+            batch_items[valid_count++] = (RamSkipItem){target_gpa, offset};
         }
+        cpu_physical_memory_unmap(hva, len, false, len);
     }
 
-    // まとめて登録
     if (valid_count > 0) {
-        qsort(batch_items, valid_count, sizeof(RamSkipItem), compare_skip_item_local);
-        collect_list_bulk(batch_items, valid_count);
+        set_skip_bitmap_bulk(batch_items, valid_count); // まとめて一括登録 (バルク更新)
     }
-    g_free(batch_items);
 }
 
-/* [Slow Path] Bottom Half 関数
- * ルート目次からツリーを辿り、全データを処理する
+/*
+ * [第2層] スキップリストのツリー構造探索とアドレス解決
+ * 第1層から渡されたルート目次のGPAを起点に，ツリー構造を辿る．
+ * ルート目次から中間目次のGPAを取得し，さらにそこから * 末端のデータバッチ(Leaf)の
+ * GPAリストを読み出して，物理アドレス変換と登録を行う第3層へ順次引き渡す．
  */
-static void evict_processing_bh(void *opaque)
+static void process_skip_tree_mid_level(hwaddr root_gpa)
 {
-    struct timespec ts_bh_start, ts_bh_end;
-    struct timespec ts_tmp1, ts_tmp2;
-    TIMER_START(ts_bh_start);
+    SkipListRoot root;
+    cpu_physical_memory_read(root_gpa, &root, sizeof(root)); // ルート目次(L3)を読み込む
 
-    while (true) {
-        EvictWorkItem *item = NULL;
-
-        qemu_mutex_lock(&evict_queue_lock);
-        if (!QSIMPLEQ_EMPTY(&evict_work_queue)) {
-            item = QSIMPLEQ_FIRST(&evict_work_queue);
-            QSIMPLEQ_REMOVE_HEAD(&evict_work_queue, next);
-        }
-        qemu_mutex_unlock(&evict_queue_lock);
-
-        if (!item) break;
-
-        // --- 計測: 目次(Root/L2)の読み込み ---
-        TIMER_START(ts_tmp1);
-
-        // 1. ルート目次(L3)を読み込む
-        EvictRootDirectory root;
-        cpu_physical_memory_read(item->root_gpa, &root, sizeof(root));
-
-        // マジックナンバー確認 (整合性チェック)
-        if (root.magic == 0xCAFEBABE) {
-            size_t total_batches = root.total_batches;
-            size_t processed_batches = 0;
-
-            // 2. L2(中間目次)ページを走査
-            // root.l2_index_gpas には L2ページのGPAが入っている
-            for (int i = 0; i < 510 && processed_batches < total_batches; i++) {
-                hwaddr l2_page_gpa = root.l2_index_gpas[i];
-                if (l2_page_gpa == 0) continue;
-
-                // L2ページを読み込む
-                // 1ページ(4KB)には 512個の uint64_t (L1バッチのGPA) が入る
-                uint64_t l1_batch_gpas[512];
-                cpu_physical_memory_read(l2_page_gpa, l1_batch_gpas, sizeof(l1_batch_gpas));
-
-                TIMER_END(ts_tmp2);
-                TIMER_ADD(time_bh_read_dir, ts_tmp1, ts_tmp2); // ここまでが目次読み込み
-
-                // --- 計測: L1バッチ処理 (process_single_l1_batch) ---
-                TIMER_START(ts_tmp1);
-
-
-                // 3. L1(データバッチ)を走査
-                for (int j = 0; j < 512 && processed_batches < total_batches; j++) {
-                    hwaddr l1_gpa = l1_batch_gpas[j];
-                    if (l1_gpa != 0) {
-                        // データバッチを処理
-                        process_single_l1_batch(l1_gpa);
-                    }
-                    processed_batches++;
-                }
-
-                TIMER_END(ts_tmp2);
-                TIMER_ADD(time_bh_process, ts_tmp1, ts_tmp2); // ここまでがデータ処理
-                
-                // 次のループのためにタイマー再開
-                TIMER_START(ts_tmp1);
-
-            }
-        } else {
-            fprintf(stderr, "QEMU: Invalid Evict Root Magic\n");
-        }
-
-        g_free(item);
-        // アイテムの処理が完了したことを通知 (セマフォ post)
-        qemu_sem_post(&async_bh_completion_sem);
+    if (root.magic != 0xCAFEBABE) { // マジックナンバー確認 (整合性チェック)
+        fprintf(stderr, "QEMU: Invalid Evict Root Magic\n");
+        return;
     }
 
-    TIMER_END(ts_bh_end);
-    TIMER_ADD(time_bh_total, ts_bh_start, ts_bh_end);
+    size_t processed = 0;
+    // 中間目次ページを走査
+    for (int i = 0; i < 510 && processed < root.mid_entry_count; i++) {
+        if (root.mid_level_gpas[i] == 0) continue;
 
-    // ログ出力 (毎回出すと多いので、ある程度溜まったらor完了時に出す)
-    // 今回は「1回の通知」で終わる設計なので、ここで出してOKです
-    /*
-    printf("=== QEMU TIMING REPORT (ns) ===\n");
-    printf("Fast Path (Guest Wait): %zu\n", time_fast_path);
-    printf("BH Total (Background):  %zu\n", time_bh_total);
-    printf("  - Dir Read Time:      %zu\n", time_bh_read_dir);
-    printf("  - Batch Process Time: %zu\n", time_bh_process);
-    printf("Total Batches:          %zu\n", total_batches_processed);
-    printf("===============================\n");
-    */
+        // 末端データ(Leaf)のGPAリストを読み込む
+        uint64_t leaf_batch_gpas[512];
+        cpu_physical_memory_read(root.mid_level_gpas[i], leaf_batch_gpas, sizeof(leaf_batch_gpas));
 
+        // 末端データ(Leaf)の走査
+        for (int j = 0; j < 512 && processed < root.mid_entry_count; j++) {
+            if (leaf_batch_gpas[j]) process_register_leaf_batch(leaf_batch_gpas[j]);
+            processed++;
+        }
+    }
+}
+
+/*
+ * [第1層] 転送スキップ処理の非同期エントリーポイント (Bottom Half 関数)
+ * MongoDBからのトリガーによってスケジュールされ，QEMUのメインスレッド上で非同期に実行される．
+ * vCPUを長時間ブロックしないよう，キューに積まれたスキップリストのルートアドレスを取り出し，
+ * 実際のツリー探索処理(第2層)へ引き渡す．
+ */
+static void process_page_skip_bh(void *opaque)
+{
+    while (true) {
+        qemu_mutex_lock(&evict_queue_lock);
+        EvictWorkItem *item = QSIMPLEQ_FIRST(&evict_work_queue);
+        if (item) QSIMPLEQ_REMOVE_HEAD(&evict_work_queue, next);
+        qemu_mutex_unlock(&evict_queue_lock);
+
+        if (!item) break; // キューが空になったら終了
+
+        process_skip_tree_mid_level(item->root_gpa); // ツリー探索処理を開始 (第2層へ丸投げ)
+        g_free(item);
+        qemu_sem_post(&async_bh_completion_sem); // アイテムの処理が完了したことを通知 (セマフォ post)
+    }
 }
 
 /* [Fast Path] I/Oポートハンドラ (0x1240)
@@ -409,36 +258,17 @@ static void evict_processing_bh(void *opaque)
  */
 static void hypercall_mongo_evict_work_fn_async(void)
 {
-    struct timespec ts1, ts2;
-    TIMER_START(ts1);
     // グローバル変数 mongo_evict_list には、outl で送られた Root GPA が入っている前提
     hwaddr root_gpa = (hwaddr)mongo_evict_list; 
-
-    // 作業アイテムを確保
-    EvictWorkItem *item = g_new0(EvictWorkItem, 1);
-    
-    // ★ ここではデータの中身をコピーせず、住所(GPA)だけを持つ
-    item->root_gpa = root_gpa;
+    EvictWorkItem *item = g_new0(EvictWorkItem, 1); // 作業アイテムを確保
+    item->root_gpa = root_gpa; // ここではデータの中身をコピーせずGPAだけを持つ
 
     // キューに追加
     qemu_mutex_lock(&evict_queue_lock);
     QSIMPLEQ_INSERT_TAIL(&evict_work_queue, item, next);
     qemu_mutex_unlock(&evict_queue_lock);
 
-    // BHをスケジュール (後で実行するように指示)
-    qemu_bh_schedule(evict_bh);
-
-    TIMER_END(ts2);
-    TIMER_ADD(time_fast_path, ts1, ts2);
-}
-
-/* 初期化関数 (pc_init1 などで呼ぶ) */
-static void init_evict_async_mechanism(void) {
-    qemu_mutex_init(&evict_queue_lock);
-    // BHを作成。メインスレッドで実行される
-    evict_bh = qemu_bh_new(evict_processing_bh, NULL);
-    // ram.c のロックも初期化
-    init_skip_list_mutex();
+    qemu_bh_schedule(evict_bh); // BHをスケジュール (後で実行するように指示)
 }
 
 /*
@@ -447,17 +277,13 @@ static void init_evict_async_mechanism(void) {
  */
 static void wait_for_evict_bh_completion(void)
 {
-    // 1. QEMUのメインループに実行権を渡し、BHを確実に実行させる
-    qemu_bh_schedule(evict_bh);
-
-    // 2. BHに積まれている全てのアイテム数を取得
-    long count_to_wait = qatomic_xchg(&async_pending_count, 0); 
+    qemu_bh_schedule(evict_bh); // QEMUのメインループに実行権を渡し、BHを確実に実行させる
+    long count_to_wait = qatomic_xchg(&async_pending_count, 0); // BHに積まれている全てのアイテム数を取得
     
     if (count_to_wait > 0) {
-        // 3. アイテムの数だけセマフォを待つ（BQLは自動で解除されます）
+        // アイテムの数だけセマフォを待つ（BQLは自動で解除されます）
         for (long i = 0; i < count_to_wait; i++) {
-            // qemu_sem_wait は内部で BQL を解除し、待機中にメインループを回します。
-            qemu_sem_wait(&async_bh_completion_sem);
+            qemu_sem_wait(&async_bh_completion_sem); // qemu_sem_wait は内部で BQL を解除し、待機中にメインループを回す．
         }
     }
 }
@@ -467,51 +293,21 @@ static MemTxResult hypercall_data_handler(void *opaque, hwaddr addr, uint64_t va
 {
     if (size == 4) { // 32ビット書き込み(outl)のみ受け付ける
         if (addr == 0) { // low port (0x1230)
-            data_from_guest = (data_from_guest & 0xFFFFFFFF00000000ULL) | (uint32_t)val;
+            mongo_evict_list = (mongo_evict_list & 0xFFFFFFFF00000000ULL) | (uint32_t)val;
         } else if (addr == 4) { // high port (0x1234)
-            data_from_guest = (data_from_guest & 0x00000000FFFFFFFFULL) | (val << 32);
+            mongo_evict_list = (mongo_evict_list & 0x00000000FFFFFFFFULL) | (val << 32);
         }
     }
     return MEMTX_OK;
 }
 
-// GPA登録コマンド用ポート (0x1238) のハンドラ
-static MemTxResult hypercall_trigger_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
-{
-    CPUState *cpu = current_cpu;
-    //fprintf(stderr, "QEMU: Trigger received. GVA is 0x%lx. Scheduling work...\n", data_from_guest);
-    
-    async_run_on_cpu(cpu, hypercall_work_fn, RUN_ON_CPU_NULL);
-    bql_unlock();
-    qemu_cpu_kick(cpu);
-    bql_lock();
-    return MEMTX_OK;
-}
-
-//  GPAの内容を覗き見る(0x1239) のハンドラ
-static MemTxResult hypercall_peek_trigger_handler(void *opaque, hwaddr addr, uint64_t val,
-                                                  unsigned size, MemTxAttrs attrs)
-{
-    CPUState *cpu = current_cpu;
-    fprintf(stderr, "QEMU: Peek trigger received for GPA 0x%lx.\n", data_from_guest);
-    
-    async_run_on_cpu(cpu, hypercall_peek_work_fn, RUN_ON_CPU_NULL);
-    bql_unlock();
-    qemu_cpu_kick(cpu);
-    bql_lock();
-    return MEMTX_OK;
-}
-
-// mongoDBのスキップリストのGPA登録コマンド用ポート (0x1240) のハンドラ
+// mongoDBのスキップリストのGPA登録コマンド用ポート (0x1240) ハンドラ
 static MemTxResult hypercall_mongo_evict_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
 {
-    // data_from_guest に入っている値をリストのGPAとして保存
-    mongo_evict_list = data_from_guest;
     // 非同期処理待ちのアイテム数をカウントアップ
     // これにより、同期関数（wait_for_evict_bh_completion）が呼ばれた際に「あと何回セマフォを待てば全ての処理が終わるか」を知ることができます。
     qatomic_inc(&async_pending_count);
-    // 非同期版を呼ぶ（内部でキュー追加とBHスケジュールが行われる）
-    hypercall_mongo_evict_work_fn_async();
+    hypercall_mongo_evict_work_fn_async(); // 非同期版を呼ぶ（内部でキュー追加とBHスケジュールが行われる）
     return MEMTX_OK;
 }
 
@@ -531,51 +327,52 @@ static MemTxResult mongo_cmd_read(void *opaque, hwaddr addr, uint64_t *value,
     return MEMTX_OK; // 成功ステータスを返す
 }
 
-// 書き込みハンドラ (MongoDB -> QEMU: 受け取りました/完了しました)
+// 書き込みハンドラ (MongoDB -> QEMU: 受け取りました/完了しました)(ポート 0x1241)
 static MemTxResult mongo_cmd_write(void *opaque, hwaddr addr, uint64_t value, 
                                    unsigned size, MemTxAttrs attrs)
 {
-    // MongoDBが outl(0, 0x5004) した時に呼ばれる
+    // MongoDBが outl(0, 0x1241) した時に呼ばれる
     if (value == 0) {
         //printf("QEMU: MongoDB acknowledged command. Flag reset.\n");
         mongo_command_flag = 0;
     }
-    
     return MEMTX_OK; // 成功ステータスを返す
 }
 
-/* * 同期ポートハンドラ
+/* * 同期ポートハンドラ (ポート 0x1242)
  * ゲストがここに書き込むと、QEMU側の処理完了までブロックします。
  */
 static MemTxResult hypercall_mongo_evict_sync_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
 {
-    // 値が 1 のときだけ同期を実行
-    if (val == 1) {
+    if (val == 1) { // 値が 1 のときだけ同期を実行
         wait_for_evict_bh_completion();
     }
     return MEMTX_OK;
 }
 
-// キャッシュクリア完了通知用ハンドラ (例: ポート 0x1243)
+// キャッシュクリア完了通知用ハンドラ (ポート 0x1243)
 static MemTxResult hypercall_mongo_evict_sem_handler(void *opaque, hwaddr addr, uint64_t val, unsigned size, MemTxAttrs attrs)
 {
     // ゲストから '1' が書き込まれたら完了とみなす
     if (val == 1) {
         mongo_clear_status = 1;
-        // 待機中のマイグレーションスレッド (ram_save_setup) を起こす
-        qemu_sem_post(&mongo_clear_sem);
+        qemu_sem_post(&mongo_clear_sem); // 待機中のマイグレーションスレッド (ram_save_setup) を起こす
     }
     return MEMTX_OK;
 }
 
 // MemoryRegionOpsの定義
 static const MemoryRegionOps data_ops = { .write_with_attrs = hypercall_data_handler, .endianness = DEVICE_LITTLE_ENDIAN };
-static const MemoryRegionOps trigger_ops = { .write_with_attrs = hypercall_trigger_handler, .endianness = DEVICE_LITTLE_ENDIAN };
-static const MemoryRegionOps peek_trigger_ops = { .write_with_attrs = hypercall_peek_trigger_handler, .endianness = DEVICE_LITTLE_ENDIAN };
 static const MemoryRegionOps mongo_evict_ops = { .write_with_attrs = hypercall_mongo_evict_handler, .endianness = DEVICE_LITTLE_ENDIAN };
 static const MemoryRegionOps mongo_cmd_ops = { .read_with_attrs = mongo_cmd_read, .write_with_attrs = mongo_cmd_write, .endianness = DEVICE_LITTLE_ENDIAN };
 static const MemoryRegionOps mongo_sync_ops = { .write_with_attrs = hypercall_mongo_evict_sync_handler, .endianness = DEVICE_LITTLE_ENDIAN };
 static const MemoryRegionOps mongo_sem_ops = { .write_with_attrs = hypercall_mongo_evict_sem_handler, .endianness = DEVICE_LITTLE_ENDIAN };
+
+/* ゲストからの非同期ハイパーコール処理機構 (キューとBH) の初期化 */
+static void init_evict_async_mechanism(void) {
+    qemu_mutex_init(&evict_queue_lock);
+    evict_bh = qemu_bh_new(process_page_skip_bh, NULL); // メインスレッドで実行されるBHを作成
+}
 
 /* PC hardware initialisation */
 static void pc_init1(MachineState *machine, const char *pci_type)
@@ -782,16 +579,6 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     memory_region_init_io(data_mr, NULL, &data_ops, NULL, "hypercall-data", 8);
     memory_region_add_subregion(get_system_io(), 0x1230, data_mr);
 
-    // GVA -> GPAの変換を行い、スキップリストに追加するトリガーポート (0x1238)
-    MemoryRegion *trigger_mr = g_new(MemoryRegion, 1);
-    memory_region_init_io(trigger_mr, NULL, &trigger_ops, NULL, "hypercall-trigger", 1);
-    memory_region_add_subregion(get_system_io(), 0x1238, trigger_mr);
-
-    // ページ覗き見用のトリガーポート (0x1239)
-    MemoryRegion *peek_mr = g_new(MemoryRegion, 1);
-    memory_region_init_io(peek_mr, NULL, &peek_trigger_ops, NULL, "hypercall-peek", 1);
-    memory_region_add_subregion(get_system_io(), 0x1239, peek_mr);
-
     // mongoDBのスキップリスト作成用のトリガーポート (0x1240)
     MemoryRegion *mongo_evict_mr = g_new(MemoryRegion, 1);
     memory_region_init_io(mongo_evict_mr, NULL, &mongo_evict_ops, NULL, "hypercall-mongo-evict", 1);
@@ -807,16 +594,17 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     memory_region_init_io(mongo_sync_mr, NULL, &mongo_sync_ops, NULL, "hypercall-mongo-sync", 1);
     memory_region_add_subregion(get_system_io(), 0x1242, mongo_sync_mr);
 
-    // mongoDB同期待機用のポート (0x1243)
+    // キャッシュクリア完了通知用のポート (0x1243)
     MemoryRegion *mongo_sem_mr = g_new(MemoryRegion, 1);
     memory_region_init_io(mongo_sem_mr, NULL, &mongo_sem_ops, NULL, "hypercall-mongo-sem", 1);
     memory_region_add_subregion(get_system_io(), 0x1243, mongo_sem_mr);
 
     pc_nic_init(pcmc, isa_bus, pcms->pcibus);
 
-    // 非同期処理メカニズムの初期化
-    init_evict_async_mechanism();
-    init_mongo_migration_sync();
+    // MongoDB連携機能の初期化
+    init_evict_async_mechanism(); // QEMU側の非同期キュー処理の初期化
+    ram_mongo_migration_init();   // RAMマイグレーション側のデータ構造初期化
+
     if (piix4_pm) {
         smi_irq = qemu_allocate_irq(pc_acpi_smi_interrupt, first_cpu, 0);
 

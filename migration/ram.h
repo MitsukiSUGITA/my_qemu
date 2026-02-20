@@ -60,8 +60,7 @@
 #define RAM_SAVE_FLAG_XBZRLE                  0x040
 #define RAM_SAVE_FLAG_HOOK                    0x080
 #define RAM_SAVE_FLAG_MULTIFD_FLUSH           0x200
-#define RAM_SAVE_FLAG_SKIPPED                 0x400
-#define RAM_SAVE_FLAG_SKIP_LIST               0x100
+#define RAM_SAVE_FLAG_SKIPPED                 0x400 //受信側にビットマップを送るならRAM_SAVE_FLAG_SKIP_BITMAP 0x100が必要かも
 
 extern XBZRLECacheStats xbzrle_counters;
 
@@ -129,13 +128,10 @@ typedef struct {
     uint64_t ram_offset;
 } RamSkipItem;
 
-void init_skip_list_mutex(void);
-int collect_list_bulk(RamSkipItem *new_items, size_t new_count);
-int collect_list(uint64_t gpa, uint64_t ram_offset);
-void print_collected_list(void);
+void ram_mongo_migration_init(void);
+int set_skip_bitmap_bulk(RamSkipItem *new_items, size_t new_count);
 void dump_guest_memory_from_gpa(uint64_t gpa);
 void dump_guest_memory_from_host(uint64_t gpa, void *host_ptr);
-void init_mongo_migration_sync(void);
 extern QemuSemaphore mongo_clear_sem;
 extern volatile int mongo_clear_status;
 
