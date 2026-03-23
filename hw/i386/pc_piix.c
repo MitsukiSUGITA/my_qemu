@@ -102,6 +102,7 @@ static void piix_intx_routing_notifier_xen(PCIDevice *dev)
 
 uint64_t mongo_evict_list = 0; // ゲストからリストの先頭GPAを受け取るための変数
 extern volatile int mongo_command_flag; // MongoDBへの指令フラグ (0:なし, 1:クリア実行せよ)
+extern volatile int mongo_done_flag; // MongoDBへの完了フラグ (0:未完了, 1:完了)
 
 // ツリー構造の末端となるデータバッチ
 typedef struct {
@@ -129,6 +130,9 @@ static QEMUBH *evict_bh = NULL;
 
 static int async_pending_count; // 非同期でキューに入ったアイテムの総数
 static QemuSemaphore async_bh_completion_sem; // BH処理完了を通知するためのセマフォ
+
+uint32_t qemu_mongo_cmd_flag = 0;
+uint32_t qemu_mongo_done_flag = 0;
 
 // GPAの内容を覗き見る(現在は使用していないが，今後のデバッグ用に残しておく)
 static void __attribute__((unused)) hypercall_peek_work_fn(CPUState *cpu, run_on_cpu_data data)
@@ -174,11 +178,11 @@ static void process_register_leaf_batch(hwaddr batch_gpa)
 
     RamSkipItem batch_items[512];
     size_t valid_count = 0;
-    hwaddr len = TARGET_PAGE_SIZE;
 
     for (uint64_t i = 0; i < list_data.entry_count; i++) {
         hwaddr target_gpa = list_data.target_gpas[i];
         if (!target_gpa) continue; // 0ならスキップ (早期リターン)
+        hwaddr len = TARGET_PAGE_SIZE;
 
         // GPA -> HVA -> RAMOffset 変換
         void *hva = cpu_physical_memory_map(target_gpa, &len, false); // GPA -> HVA 変換
@@ -355,7 +359,7 @@ static MemTxResult hypercall_mongo_evict_sem_handler(void *opaque, hwaddr addr, 
 {
     // ゲストから '1' が書き込まれたら完了とみなす
     if (val == 1) {
-        mongo_clear_status = 1;
+        mongo_done_flag = 1;
         qemu_sem_post(&mongo_clear_sem); // 待機中のマイグレーションスレッド (ram_save_setup) を起こす
     }
     return MEMTX_OK;
@@ -603,7 +607,6 @@ static void pc_init1(MachineState *machine, const char *pci_type)
 
     // MongoDB連携機能の初期化
     init_evict_async_mechanism(); // QEMU側の非同期キュー処理の初期化
-    ram_mongo_migration_init();   // RAMマイグレーション側のデータ構造初期化
 
     if (piix4_pm) {
         smi_irq = qemu_allocate_irq(pc_acpi_smi_interrupt, first_cpu, 0);

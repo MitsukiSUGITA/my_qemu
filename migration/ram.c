@@ -71,6 +71,8 @@
 // 1にすると同期処理を実行し、0にするとスキップ（対照実験用）
 #define ENABLE_MONGO_SYNC_EXPERIMENT 1
 
+uint64_t total_canceled_pages = 0;
+
 #if defined(__linux__)
 #include "qemu/userfaultfd.h"
 #endif /* defined(__linux__) */
@@ -450,9 +452,9 @@ static unsigned long *skip_bitmap = NULL; // MongoDBキャッシュクリアで�
 static uint64_t skip_bitmap_size = 0;
 uint64_t actual_skipped_pages = 0; // 実際にスキップされたページ数をカウントする変数
 volatile int mongo_command_flag = 0; // MongoDBへの指令フラグ (0:なし, 1:クリア実行せよ)
+volatile int mongo_done_flag = 0; // 完了ステータス (0:未完了, 1:完了, 2:タイムアウト/エラー)
 QemuMutex skip_list_mutex;
 QemuSemaphore mongo_clear_sem; // MongoDBキャッシュクリア完了待ち用のセマフォ
-volatile int mongo_clear_status = 0; // 完了ステータス (0:未完了, 1:完了, 2:タイムアウト/エラー)
 
 // 内部呼び出し用の共通ダンプ処理
 static void dump_memory_hex(uint64_t gpa, char *hva, uint64_t len)
@@ -486,7 +488,7 @@ void dump_guest_memory_from_gpa(uint64_t gpa)
 void ram_mongo_migration_init(void)
 {
     qemu_sem_init(&mongo_clear_sem, 0); // 同期機構の初期化
-    mongo_clear_status = 0; 
+    mongo_done_flag = 0; 
     qemu_mutex_init(&skip_list_mutex); // データ競合を防ぐための排他ロック初期化
     // スキップ用ビットマップの初期化
     if (!skip_bitmap) {
@@ -1019,6 +1021,7 @@ static uint64_t physical_memory_sync_dirty_bitmap(RAMBlock *rb,
     unsigned long word = BIT_WORD((start + rb->offset) >> TARGET_PAGE_BITS);
     uint64_t num_dirty = 0;
     unsigned long *dest = rb->bmap;
+    uint64_t sync_count = stat64_get(&mig_stats.dirty_sync_count);
 
     /* start address and length is aligned at the start of a word? */
     if (((word * BITS_PER_LONG) << TARGET_PAGE_BITS) ==
@@ -1038,6 +1041,16 @@ static uint64_t physical_memory_sync_dirty_bitmap(RAMBlock *rb,
         for (k = page; k < page + nr; k++) {
             if (src[idx][offset]) {
                 unsigned long bits = qatomic_xchg(&src[idx][offset], 0);
+
+                // 再利用検知とスキップキャンセル
+                if (sync_count > 1 && skip_bitmap && strcmp(rb->idstr, "pc.ram") == 0) {
+                    if (test_bit(k, skip_bitmap)) {
+                        // ゲストが再書き込みした = メモリが再利用されたか、Evictが不完全だった
+                        // スキップをキャンセルし、通常のダーティページとして転送させる
+                        clear_bit(k, skip_bitmap);
+                        total_canceled_pages++; // キャンセル数をカウント
+                    }
+                }
                 unsigned long new_dirty;
                 new_dirty = ~dest[k];
                 dest[k] |= bits;
@@ -2328,13 +2341,35 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
 
         /* Check the pages is dirty and if it is send it */
         if (page_dirty) {
-            uint64_t offset_in_block = ((ram_addr_t)pss->page << TARGET_PAGE_BITS);     
+            bool is_safe_to_skip = false;
+            uint64_t offset_in_block = ((ram_addr_t)pss->page << TARGET_PAGE_BITS);
+            uint8_t *p = pss->block->host + offset_in_block;
             if (is_ram_offset_in_skiplist(pss->block, offset_in_block)) { // スキップ対象のページだった場合の処理
-                // ダーティビットは既にクリア済み。物理的な転送は行わず、1ページ分「処理した」と見なすため、tmppagesに1をセットする。
+                uint64_t *p64 = (uint64_t *)p;
+                is_safe_to_skip = true;
+
+                int limit = TARGET_PAGE_SIZE / 8; // 512
+                
+                // 8バイト目(インデックス1)から最後まで、全てが 0xab かどうか
+                for (int i = 1; i < limit; i++) {
+                    if (p64[i] != 0xababababababababULL) {
+                        is_safe_to_skip = false;
+                        break;
+                    }
+                }
+
+                if (!is_safe_to_skip) total_canceled_pages++; 
+            }
+
+            if (is_safe_to_skip) {
+                // スマートスキップ実行
                 tmppages = 1; 
                 pages += tmppages;
                 ram_addr_t offset = ((ram_addr_t)pss->page) << TARGET_PAGE_BITS;
+                // ヘッダを送信
                 ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset | RAM_SAVE_FLAG_SKIPPED));
+                // tcmallocのフリーリストポインタ（先頭8バイト）だけを送信！
+                qemu_put_buffer(pss->pss_channel, p, 8);
                 actual_skipped_pages++;
             } else {
                 /*
@@ -3207,7 +3242,7 @@ static void wait_for_mongo_cache_clear(void)
 {
 #if ENABLE_MONGO_SYNC_EXPERIMENT
     printf("MongoSync: Triggering and waiting for cache clear...\n");
-    mongo_clear_status = 0;
+    mongo_done_flag = 0;
     mongo_command_flag = 1; // ゲスト側にポーリングさせているフラグをONにする
 
     bql_unlock(); // BQLを解除して、ゲストOS(MongoDB)が動けるようにする
@@ -3215,7 +3250,7 @@ static void wait_for_mongo_cache_clear(void)
     bql_lock(); // 待機が解けたら BQL を取り戻す
 
     // 結果確認
-    if (mongo_clear_status == 1) {
+    if (mongo_done_flag == 1) {
         printf("MongoSync: Done. Skip pages: %zu\n", bitmap_count_one(skip_bitmap, skip_bitmap_size));
     } else {
         printf("MongoSync: Done (Unknown status).\n");
@@ -3247,6 +3282,11 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
     RAMState **rsp = opaque;
     RAMBlock *block;
     int ret, max_hg_page_size;
+
+    // MongoDB連携機能の初期化
+    ram_mongo_migration_init();   // RAMマイグレーション側のデータ構造初期化
+    // 【デバッグ用】ここでビットマップのサイズが0になっていないか確認！
+    printf("MongoSync: Initialized skip_bitmap with size %lu\n", skip_bitmap_size);
 
     cpu_start = get_process_cpu_time(); //移送開始前のCPU時間を取得
     wait_for_mongo_cache_clear(); // 実験用：MongoDBのキャッシュクリア完了を待機する関数を呼び出し
@@ -3522,11 +3562,13 @@ static void output_migration_experiment_results(void)
            "Total Migration CPU Time: %.6f sec\n"
            "  Registered Skip GPAs : %zu pages\n"
            "  Actually Skipped     : %lu pages\n"
+           "  True Dirty Canceled  : %lu pages\n"
            "  Skipped Size         : %lu bytes (%.2f MB)\n"
            "=========================================\n",
            cpu_time,
            bitmap_count_one(skip_bitmap, skip_bitmap_size),
            actual_skipped_pages,
+           total_canceled_pages,
            skipped_bytes, skipped_bytes / (1024.0 * 1024.0));
 }
 
@@ -4630,6 +4672,14 @@ static int ram_load_precopy(QEMUFile *f)
             }
             break;
         case RAM_SAVE_FLAG_SKIPPED:
+            // 1. 送信側から送られた「先頭8バイト（tcmallocポインタ）」を受信する
+            uint64_t tcmalloc_ptr;
+            qemu_get_buffer(f, (uint8_t *)&tcmalloc_ptr, 8);
+            // 2. ページ全体をポイズン(0xab)で再構築する（4096バイト）
+            memset(host, 0xab, TARGET_PAGE_SIZE);
+            // 3. 受信した重要な8バイトをページの先頭に書き戻す
+            *(uint64_t *)host = tcmalloc_ptr;
+            break;
         /*ここはまだ仮だが，受信側での「キャッシュ復元」に必要なスキップ情報もビットマップとして完璧に再構築する処理を追加する必要があるかも
             if (skip_bitmap) {
                 // addr はターゲットページサイズでアライメントされたオフセット
