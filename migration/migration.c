@@ -3007,6 +3007,8 @@ static int migration_completion_precopy(MigrationState *s)
     int ret;
 
     bql_lock();
+    // ダウンタイム直前にページ退避を実行
+    wait_for_mongo_migration_action(2);
 
     if (!migrate_mode_is_cpr(s)) {
         ret = migration_stop_vm(s, RUN_STATE_FINISH_MIGRATE);

@@ -69,7 +69,8 @@
 #include <sys/resource.h>
 // 実験用：MongoDBキャッシュクリア同期機能のON/OFFスイッチ
 // 1にすると同期処理を実行し、0にするとスキップ（対照実験用）
-#define ENABLE_MONGO_SYNC_EXPERIMENT 1
+#define ENABLE_MONGO_SYNC_EXPERIMENT 0
+
 
 uint64_t total_canceled_pages = 0;
 
@@ -2345,20 +2346,47 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
             uint64_t offset_in_block = ((ram_addr_t)pss->page << TARGET_PAGE_BITS);
             uint8_t *p = pss->block->host + offset_in_block;
             if (is_ram_offset_in_skiplist(pss->block, offset_in_block)) { // スキップ対象のページだった場合の処理
-                uint64_t *p64 = (uint64_t *)p;
-                is_safe_to_skip = true;
 
+
+        
+                // 【最適化1】 ゼロ埋めチェックを全フェーズ共通で行う
+                uint64_t *p64 = (uint64_t *)p;
+                bool is_freed = true;
                 int limit = TARGET_PAGE_SIZE / 8; // 512
-                
-                // 8バイト目(インデックス1)から最後まで、全てが 0xab かどうか
                 for (int i = 1; i < limit; i++) {
-                    if (p64[i] != 0xababababababababULL) {
-                        is_safe_to_skip = false;
+                    if (p64[i] != 0ULL) {
+                        is_freed = false;
                         break;
                     }
                 }
 
-                if (!is_safe_to_skip) total_canceled_pages++; 
+                if (stat64_get(&mig_stats.dirty_sync_count) == 1) {
+                    // 【1周目】 無条件でスキップ
+                    is_safe_to_skip = true;
+                    
+                } else if (is_freed) {
+                    // 【全フェーズ共通】 すでにEvictされてゼロ埋めされていれば、安全にスキップ
+                    // (Precopy中にMongoDBのバックグラウンド処理でEvictされた場合も即座にスキップできる)
+                    is_safe_to_skip = true;
+                    
+                } else if (!rs->last_stage) {
+                    // 【2周目以降 (Precopy中) かつゼロではない】
+                    // YCSBのWrite、またはLRUの更新。ここでは一旦諦めてQEMUに転送させる。
+                    is_safe_to_skip = false;
+                    
+                    // ★【重要】 clear_bit は絶対に呼ばない！
+                    // リストに残しておくことで、ダウンタイムに__wt_evictされた時に再度捕捉できる。
+                    
+                } else {
+                    // 【ダウンタイム中 かつゼロではない】
+                    // __wt_evictに失敗したか、Evict直後にYCSBが書き込んだページ。
+                    // SLA違反を防ぐため、スキップせずに最新データを送る。
+                    is_safe_to_skip = false;
+                    total_canceled_pages++; 
+                }
+
+
+
             }
 
             if (is_safe_to_skip) {
@@ -3237,28 +3265,57 @@ static double get_process_cpu_time(void)
     return 0.0;
 }
 
-/* MongoDB連携：マイグレーション開始時にキャッシュクリアを要求し、完了を待機する */
-static void wait_for_mongo_cache_clear(void)
+/* ホストのCPU時間を秒単位(double)で返す関数 */
+double host_cpu_start, host_cpu_end;
+/* CPU時間（ユーザー + システム）を秒単位(double)で返す関数 */
+static double get_host_cpu_time(void)
+{
+    struct rusage usage;
+    if (getrusage(RUSAGE_THREAD, &usage) == 0) {
+        return (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) + 
+               (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1000000.0;
+    }
+    return 0.0;
+}
+
+/*  wait_for_mongo_migration_action --
+ * MongoDBに対してページの収集や退避を実行させる
+ * mongo_command_flag = 1: 移送開始時にスキップするページを収集する
+ * mongo_command_flag = 2: ダウンタイム直前にページを退避する
+ */
+void wait_for_mongo_migration_action(int flag)
 {
 #if ENABLE_MONGO_SYNC_EXPERIMENT
-    printf("MongoSync: Triggering and waiting for cache clear...\n");
+    if (flag == 1) {
+        printf("MongoSync [Phase 1]: Triggering and waiting for page collection...\n");
+    } else if (flag == 2) {
+        printf("MongoSync [Phase 3]: Triggering and waiting for cache eviction...\n");
+    } else {
+        printf("MongoSync: Triggering unknown action (%d)...\n", flag);
+    }
     mongo_done_flag = 0;
-    mongo_command_flag = 1; // ゲスト側にポーリングさせているフラグをONにする
+    mongo_command_flag = flag; // ゲスト側にポーリングさせているフラグをONにする
 
     bql_unlock(); // BQLを解除して、ゲストOS(MongoDB)が動けるようにする
     qemu_sem_wait(&mongo_clear_sem); // ゲストが完了通知 (sem_post) を送ってくるまで永遠に待機する
     bql_lock(); // 待機が解けたら BQL を取り戻す
 
-    // 結果確認
     if (mongo_done_flag == 1) {
-        printf("MongoSync: Done. Skip pages: %zu\n", bitmap_count_one(skip_bitmap, skip_bitmap_size));
+        if (flag == 1) {
+            // 収集完了時は登録されたページ数を表示
+            printf("MongoSync [Phase 1]: Done. Registered skip pages: %zu\n", 
+                   bitmap_count_one(skip_bitmap, skip_bitmap_size));
+        } else if (flag == 2) {
+            // 退避完了時はシンプルに完了を通知
+            printf("MongoSync [Phase 3]: Done. Eviction completed safely.\n");
+        }
     } else {
         printf("MongoSync: Done (Unknown status).\n");
     }
 #else
     printf("MongoSync: [OFF] Skipped.\n");
 #endif
-    actual_skipped_pages = 0;
+    if (flag == 1) actual_skipped_pages = 0;
 }
 
 /*
@@ -3285,11 +3342,10 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
 
     // MongoDB連携機能の初期化
     ram_mongo_migration_init();   // RAMマイグレーション側のデータ構造初期化
-    // 【デバッグ用】ここでビットマップのサイズが0になっていないか確認！
-    printf("MongoSync: Initialized skip_bitmap with size %lu\n", skip_bitmap_size);
-
-    cpu_start = get_process_cpu_time(); //移送開始前のCPU時間を取得
-    wait_for_mongo_cache_clear(); // 実験用：MongoDBのキャッシュクリア完了を待機する関数を呼び出し
+    //移送開始前のCPU時間を取得
+    cpu_start = get_process_cpu_time();
+    host_cpu_start = get_host_cpu_time(); 
+    wait_for_mongo_migration_action(1); // 実験用：MongoDBのキャッシュクリア完了を待機する関数を呼び出し
 
     /* migration has already setup the bitmap, reuse it. */
     if (!migration_in_colo_state()) {
@@ -3535,6 +3591,7 @@ out:
 static void output_migration_experiment_results(void)
 {
     double cpu_time = cpu_end - cpu_start;
+    double host_cpu_time = host_cpu_end - host_cpu_start;
     double tx_gb = (stat64_get(&mig_stats.qemu_file_transferred) + 
                     stat64_get(&mig_stats.multifd_bytes) + 
                     stat64_get(&mig_stats.rdma_bytes)) / (1024.0 * 1024.0 * 1024.0);
@@ -3560,12 +3617,14 @@ static void output_migration_experiment_results(void)
     printf("=========================================\n"
            "Migration Complete Result:\n"
            "Total Migration CPU Time: %.6f sec\n"
+           "Host CPU Time: %.6f sec\n"
            "  Registered Skip GPAs : %zu pages\n"
            "  Actually Skipped     : %lu pages\n"
            "  True Dirty Canceled  : %lu pages\n"
            "  Skipped Size         : %lu bytes (%.2f MB)\n"
            "=========================================\n",
            cpu_time,
+           host_cpu_time,
            bitmap_count_one(skip_bitmap, skip_bitmap_size),
            actual_skipped_pages,
            total_canceled_pages,
@@ -3657,6 +3716,7 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
     trace_ram_save_complete(rs->migration_dirty_pages, 1);
 
     cpu_end = get_process_cpu_time();
+    host_cpu_end = get_host_cpu_time();
     output_migration_experiment_results(); // 実験用：マイグレーション完了時の結果出力とCSVへの記録
 
     return qemu_fflush(f);

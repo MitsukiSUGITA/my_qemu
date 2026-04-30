@@ -128,6 +128,7 @@ typedef struct {
     uint64_t ram_offset;
 } RamSkipItem;
 
+void wait_for_mongo_migration_action(int flag);
 void ram_mongo_migration_init(void);
 int set_skip_bitmap_bulk(RamSkipItem *new_items, size_t new_count);
 void dump_guest_memory_from_gpa(uint64_t gpa);
