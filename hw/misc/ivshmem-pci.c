@@ -912,10 +912,16 @@ static void ivshmem_common_realize(PCIDevice *dev, Error **errp)
     }
 
     if (!ivshmem_is_master(s)) {
-        error_setg(&s->migration_blocker,
-                   "Migration is disabled when using feature 'peer mode' in device 'ivshmem'");
-        if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
-            return;
+        // 環境変数 QEMU_ALLOW_IVSHMEM_MIGRATION が設定されていない場合のみエラーにしてマイグレーションをブロックする
+        if (getenv("QEMU_ALLOW_IVSHMEM_MIGRATION") == NULL) {
+            error_setg(&s->migration_blocker,
+                    "Migration is disabled when using feature 'peer mode' in device 'ivshmem'");
+            if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
+                return;
+            }
+        } else {
+            /* 環境変数が設定されている場合は警告だけ出して続行する */
+            fprintf(stderr, "WARNING: IVSHMEM migration blocker bypassed for research.\n");
         }
     }
 
@@ -974,8 +980,14 @@ static int ivshmem_pre_load(void *opaque)
     IVShmemState *s = opaque;
 
     if (!ivshmem_is_master(s)) {
-        error_report("'peer' devices are not migratable");
-        return -EINVAL;
+        // 環境変数が設定されていれば受信ブロックも解除する
+        if (getenv("QEMU_ALLOW_IVSHMEM_MIGRATION") == NULL) {
+            error_report("'peer' devices are not migratable");
+            return -EINVAL;
+        } else {
+            // 環境変数がある場合は、そのまま通す
+            return 0; 
+        }
     }
 
     return 0;

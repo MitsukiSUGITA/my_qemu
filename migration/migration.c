@@ -845,6 +845,15 @@ static void process_incoming_migration_bh(void *opaque)
              */
             if (migration_block_activate(NULL)) {
                 vm_start();
+#if ENABLE_MONGO_SYNC_EXPERIMENT
+                /*
+                 * ★フェーズ4: 移送先での再開通知
+                 * QEMUのイベントループを止めないように、非同期でフラグだけセットする
+                 */
+                wait_for_mongo_migration_action(3);
+                
+                fprintf(stderr, "[MONGO-SYNC] Target VM resumed. Sent Phase 4 (Resume) signal (3).\n");
+#endif
             }
         } else {
             runstate_set(RUN_STATE_PAUSED);
@@ -3007,8 +3016,6 @@ static int migration_completion_precopy(MigrationState *s)
     int ret;
 
     bql_lock();
-    // ダウンタイム直前にページ退避を実行
-    wait_for_mongo_migration_action(2);
 
     if (!migrate_mode_is_cpr(s)) {
         ret = migration_stop_vm(s, RUN_STATE_FINISH_MIGRATE);
@@ -3461,12 +3468,92 @@ typedef enum {
     MIG_ITERATE_BREAK,          /* Break the loop */
 } MigIterateState;
 
+#if ENABLE_MONGO_SYNC_EXPERIMENT
+// MongoDBのバリア状態を管理
+typedef enum {
+    MONGO_BARRIER_NONE = 0,
+    MONGO_BARRIER_IN_PROGRESS,
+    MONGO_BARRIER_COMPLETED
+} MongoBarrierState;
+
+static MongoBarrierState mongo_state = MONGO_BARRIER_NONE;
+static QemuThread mongo_barrier_thread;
+
+// 非同期で実行される関数
+static void *mongo_barrier_worker(void *opaque)
+{
+    fprintf(stderr, "[MONGO-ASYNC] Background thread started. Waiting for MongoDB barrier...\n");
+    
+    // 重いバリア処理（キャッシュクリア＆ロック）をここで実行
+    wait_for_mongo_migration_action(2);
+    
+    // 完了したらフラグを「完了」に更新
+    // ※厳密にはアトミック操作が望ましいですが、単純なフラグならこれで動きます
+    qatomic_set(&mongo_state, MONGO_BARRIER_COMPLETED);
+    
+    fprintf(stderr, "[MONGO-ASYNC] Barrier completed. Main thread can now finish.\n");
+    return NULL;
+}
+#endif
+
 /*
  * Return true if continue to the next iteration directly, false
  * otherwise.
  */
 static MigIterateState migration_iteration_run(MigrationState *s)
 {
+    static int64_t last_log_time = 0;
+    static uint64_t last_bytes = 0;
+    static double last_cpu = 0.0;
+    static int monitor_counter = 0; // 画面出力の間引き用
+    static int elapsed_sec = 0;     // 経過秒数の記録用
+
+    int64_t current_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+    if (last_log_time == 0) {
+        last_log_time = current_time;
+        last_bytes = migration_transferred_bytes();
+        last_cpu = get_host_cpu_time(); // RUSAGE_THREAD
+        
+        // ★実験開始時：裏でCSVファイルを新規作成し、ヘッダーを書き込む
+        FILE *fp = fopen("/tmp/qemu_metrics.csv", "w");
+        if (fp) {
+            fprintf(fp, "Seconds,CPU_Usage(%%),Bandwidth(Mbps)\n");
+            fclose(fp);
+        }
+    } else if (current_time - last_log_time >= 1000) {
+        // 1秒（1000ms）以上経過したら計算
+        uint64_t current_bytes = migration_transferred_bytes();
+        double current_cpu = get_host_cpu_time();
+
+        double diff_cpu = current_cpu - last_cpu;
+        uint64_t diff_bytes = current_bytes - last_bytes;
+        
+        double bandwidth_mbps = (diff_bytes * 8.0) / 1000000.0;
+        double cpu_usage_percent = diff_cpu * 100.0;
+        elapsed_sec++;
+
+        // ★【変更1】1秒ごとの高解像度データは、裏でCSVファイルに直接追記する（画面には出ない）
+        FILE *fp = fopen("/tmp/qemu_metrics.csv", "a");
+        if (fp) {
+            fprintf(fp, "%d,%.2f,%.2f\n", elapsed_sec, cpu_usage_percent, bandwidth_mbps);
+            fclose(fp);
+        }
+
+        // ★【変更2】画面（モニター/ログファイル）への出力は30秒に1回だけにする
+        monitor_counter++;
+        if (monitor_counter >= 30) {
+            fprintf(stderr, "[MONGO-SYNC-MONITOR] %d sec | CPU: %.2f %% | BW: %.2f Mbps\n",
+                    elapsed_sec, cpu_usage_percent, bandwidth_mbps);
+            monitor_counter = 0;
+        }
+
+        // 状態を更新
+        last_log_time = current_time;
+        last_bytes = current_bytes;
+        last_cpu = current_cpu;
+    }
+
     uint64_t must_precopy, can_postcopy, pending_size;
     Error *local_err = NULL;
     bool in_postcopy = (s->state == MIGRATION_STATUS_POSTCOPY_DEVICE ||
@@ -3529,7 +3616,46 @@ static MigIterateState migration_iteration_run(MigrationState *s)
          * (2) Pending size is no more than the threshold specified
          *     (which was calculated from expected downtime)
          */
+#if ENABLE_MONGO_SYNC_EXPERIMENT
+
+    // 状態に応じて振る舞いを変える
+    if (mongo_state == MONGO_BARRIER_NONE && can_switchover && (pending_size <= s->threshold_size)) {
+        
+        // --- 手順1: 非同期スレッドの起動（ブロックしない） ---
+        fprintf(stderr, "[MONGO-MAIN] Threshold reached. Spawning async barrier thread...\n");
+        mongo_state = MONGO_BARRIER_IN_PROGRESS;
+        
+        // 別スレッドで MongoDB のバリア処理を開始
+        qemu_thread_create(&mongo_barrier_thread, "mongo_barrier",
+                           mongo_barrier_worker, NULL, QEMU_THREAD_DETACHED);
+        
+        // メインスレッドはすぐにループに戻り、転送を継続する
+        complete_ready = false; 
+
+    } else if (mongo_state == MONGO_BARRIER_IN_PROGRESS) {
+        
+        // --- 手順2: 待ち時間（ドレインフェーズ前半） ---
+        // 裏でMongoDBがロックしている最中。
+        // QEMUは転送を続けるが、まだ完了（switchover）はさせない。
+        complete_ready = false;
+
+    } else if (mongo_state == MONGO_BARRIER_COMPLETED) {
+        
+        // --- 手順3: 最終ドレインフェーズ ---
+        // MongoDBのロックが完了し、新たなダーティページが発生しなくなった状態。
+        // 残りの pending_size が閾値を下回れば、本当に完了してよい。
         complete_ready = can_switchover && (pending_size <= s->threshold_size);
+        
+        if (complete_ready) {
+            fprintf(stderr, "[MONGO-MAIN] Async barrier done & pages drained. Final pending: %" PRIu64 "\n", pending_size);
+        }
+    } else {
+        complete_ready = false; // 万が一のためのフォールバック
+    }
+
+#else
+        complete_ready = can_switchover && (pending_size <= s->threshold_size);
+#endif
     }
 
     if (complete_ready) {
@@ -3561,6 +3687,8 @@ static void migration_iteration_finish(MigrationState *s)
     switch (s->state) {
     case MIGRATION_STATUS_COMPLETED:
         runstate_set(RUN_STATE_POSTMIGRATE);
+        output_migration_experiment_results(); // 実験用：マイグレーション完了時の結果出力とCSVへの記録
+
         break;
     case MIGRATION_STATUS_COLO:
         assert(migrate_colo());
