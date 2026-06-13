@@ -845,6 +845,11 @@ static void process_incoming_migration_bh(void *opaque)
              */
             if (migration_block_activate(NULL)) {
                 vm_start();
+#if ENABLE_MONGO_SYNC_EXPERIMENT
+                // 移送先VMの再開を検知し、MongoDBへフェーズ4（再開通知）のシグナルを送信
+                wait_for_mongo_migration_action(3);
+                fprintf(stderr, "[MIG-INFO] Target VM resumed.\n");
+#endif
             }
         } else {
             runstate_set(RUN_STATE_PAUSED);
@@ -3459,12 +3464,78 @@ typedef enum {
     MIG_ITERATE_BREAK,          /* Break the loop */
 } MigIterateState;
 
+#if ENABLE_MONGO_SYNC_EXPERIMENT
+/* MongoDBのグローバル排他ロックをメインループから切り離して非同期管理するための状態定義 */
+typedef enum {
+    MONGO_BARRIER_NONE = 0,
+    MONGO_BARRIER_IN_PROGRESS,
+    MONGO_BARRIER_COMPLETED
+} MongoBarrierState;
+
+static MongoBarrierState mongo_state = MONGO_BARRIER_NONE;
+static QemuThread mongo_barrier_thread;
+
+/* メインのメモリ転送処理を止めずに、バックグラウンドでMongoDBを静止させるワーカースレッド */
+static void *mongo_barrier_worker(void *opaque)
+{
+    fprintf(stderr, "[MIG-INFO] Async barrier thread started. Requesting MongoDB lock...\n");
+    // ゲスト側のMongoDBへ静止コマンドを発行し、完了するまでこのスレッドのみブロック
+    wait_for_mongo_migration_action(2);
+    // メインスレッドに最終フェーズ（switchover）への移行を許可するため、状態をアトミックに更新
+    qatomic_set(&mongo_state, MONGO_BARRIER_COMPLETED);
+    fprintf(stderr, "[MIG-INFO] Async barrier completed. Switchover unlocked.\n");
+    return NULL;
+}
+#endif
+
+/* 1秒ごとのマイグレーション統計情報を計算し、CSVと標準エラー出力に記録する */
+static inline void log_migration_metrics(int64_t current_time)
+{
+    static int64_t last_time = 0;
+    static uint64_t last_bytes = 0;
+    static double last_cpu = 0.0;
+    static int sec = 0, mon = 0;
+    static FILE *fp = NULL;
+
+    if (last_time == 0) { // 初回のみ状態初期化とCSVセットアップ
+        last_bytes = migration_transferred_bytes();
+        last_cpu = get_mig_thread_cpu_time();
+        if ((fp = fopen("/tmp/qemu_metrics.csv", "w"))) {
+            setvbuf(fp, NULL, _IOLBF, 0);
+            fprintf(fp, "Seconds,CPU_Usage(%%),Bandwidth(Mbps)\n");
+        }
+        last_time = current_time;
+        return;
+    }
+
+    if (current_time - last_time < 1000) return; // 1秒未満なら早期リターンしてネストを排除
+
+    uint64_t cur_bytes = migration_transferred_bytes();
+    double cur_cpu = get_mig_thread_cpu_time();
+    // 差分計算と単位変換を1行に集約
+    double cpu_pct = (cur_cpu - last_cpu) * 100.0;
+    double bw_mbps = (cur_bytes - last_bytes) * 8.0 / 1000000.0;
+    if (fp) fprintf(fp, "%d,%.2f,%.2f\n", ++sec, cpu_pct, bw_mbps);
+    if (++mon >= 30) { // 30秒に1回だけ画面出力しカウンタをリセット
+        fprintf(stderr, "[MIG-STATS] %d sec | CPU: %.2f %% | BW: %.2f Mbps\n", sec, cpu_pct, bw_mbps);
+        mon = 0;
+    }
+
+    last_time = current_time;
+    last_bytes = cur_bytes;
+    last_cpu = cur_cpu;
+}
+
 /*
  * Return true if continue to the next iteration directly, false
  * otherwise.
  */
 static MigIterateState migration_iteration_run(MigrationState *s)
 {
+    int64_t current_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    // 統計情報の記録関数
+    log_migration_metrics(current_time);
+
     uint64_t must_precopy, can_postcopy, pending_size;
     Error *local_err = NULL;
     bool in_postcopy = (s->state == MIGRATION_STATUS_POSTCOPY_DEVICE ||
@@ -3527,7 +3598,30 @@ static MigIterateState migration_iteration_run(MigrationState *s)
          * (2) Pending size is no more than the threshold specified
          *     (which was calculated from expected downtime)
          */
+#if ENABLE_MONGO_SYNC_EXPERIMENT
+    if (mongo_state == MONGO_BARRIER_NONE && can_switchover && (pending_size <= s->threshold_size)) {
+        // 閾値到達：MongoDB排他ロック用スレッドを非同期起動し、メインの転送ループは継続
+        fprintf(stderr, "[MIG-INFO] Threshold reached. Async barrier started.\n");
+        mongo_state = MONGO_BARRIER_IN_PROGRESS; // スレッドの多重起動を防止
+        // バックグラウンドでMongoDB側の排他ロックを要求
+        qemu_thread_create(&mongo_barrier_thread, "mongo_barrier", mongo_barrier_worker, NULL, QEMU_THREAD_DETACHED);
+        // ロック完了までマイグレーションの終了判定を保留し、メインスレッドはメモリ転送を続行
+        complete_ready = false; 
+    } else if (mongo_state == MONGO_BARRIER_IN_PROGRESS) {
+        // ロック完了待ち：MongoDBの静止処理中のため、まだswitchoverさせない
+        complete_ready = false;
+    } else if (mongo_state == MONGO_BARRIER_COMPLETED) {
+        // ロック完了後：静止状態で残りのダーティページを転送しきったら最終フェーズへ移行
         complete_ready = can_switchover && (pending_size <= s->threshold_size);
+        if (complete_ready) {
+            fprintf(stderr, "[MIG-INFO] Barrier done. Pending: %.2f MB\n", (double)pending_size / (1024.0 * 1024.0));
+        }
+    } else {
+        complete_ready = false; // 万が一の未定義状態フォールバック
+    }
+#else
+        complete_ready = can_switchover && (pending_size <= s->threshold_size);
+#endif
     }
 
     if (complete_ready) {
@@ -3559,6 +3653,7 @@ static void migration_iteration_finish(MigrationState *s)
     switch (s->state) {
     case MIGRATION_STATUS_COMPLETED:
         runstate_set(RUN_STATE_POSTMIGRATE);
+        output_migration_experiment_results(); // 移送完了時の結果出力とCSVへの記録
         break;
     case MIGRATION_STATUS_COLO:
         assert(migrate_colo());
