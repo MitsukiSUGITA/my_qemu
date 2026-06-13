@@ -3653,8 +3653,7 @@ static void migration_iteration_finish(MigrationState *s)
     switch (s->state) {
     case MIGRATION_STATUS_COMPLETED:
         runstate_set(RUN_STATE_POSTMIGRATE);
-        output_migration_experiment_results(); // 実験用：マイグレーション完了時の結果出力とCSVへの記録
-
+        output_migration_experiment_results(); // 移送完了時の結果出力とCSVへの記録
         break;
     case MIGRATION_STATUS_COLO:
         assert(migrate_colo());

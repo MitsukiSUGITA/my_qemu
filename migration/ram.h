@@ -123,17 +123,9 @@ void ram_write_tracking_prepare(void);
 int ram_write_tracking_start(void);
 void ram_write_tracking_stop(void);
 
-typedef struct {
-    uint64_t gpa;
-    uint64_t ram_offset;
-} RamSkipItem;
-
 void wait_for_mongo_migration_action(int flag);
 void mmap_shared_bitmap(void);
 void ram_mongo_migration_init(void);
-int set_skip_bitmap_bulk(RamSkipItem *new_items, size_t new_count);
-void dump_guest_memory_from_gpa(uint64_t gpa);
-void dump_guest_memory_from_host(uint64_t gpa, void *host_ptr);
 bool consume_skipbitmap_token(RAMBlock *block, uint64_t ram_offset);
 void output_migration_experiment_results(void);
 double get_mig_thread_cpu_time(void);

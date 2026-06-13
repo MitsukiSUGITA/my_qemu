@@ -68,9 +68,27 @@
 
 #include <sys/resource.h>
 
-#define WT_HDR_SKIP_SIZE 64 // Write Trackingのヘッダ部分のサイズ (バイト単位)
-uint8_t *mongo_shared_bitmap = NULL; // MongoDBとの共有ビットマップ用グローバルポインタ
-size_t mongo_bitmap_size = 8 * 1024 * 1024; // 8MBのビットマップで，最大64GBのRAMを管理可能
+/* ============================================================================
+ * MongoDB Zero-Copy Migration: Global State & Configuration
+ * ============================================================================ */
+
+#define WT_HDR_SKIP_SIZE 64                     /* 転送スキップ時に送るWiredTiger軽量ヘッダのサイズ(Bytes) */
+
+/* --- 1. 共有メモリ (IVSHMEM) 関連 --- */
+uint8_t *mongo_shared_bitmap = NULL;            /* QEMUとDBを繋ぐゼロコピー判定用ビットマップの先頭ポインタ */
+size_t   mongo_bitmap_size   = 8 * 1024 * 1024; /* ビットマップのサイズ (8MB = 最大64GBのゲストRAMを管理可能) */
+
+/* --- 2. ホスト・ゲスト間同期 (シグナリング) 関連 --- */
+volatile int  mongo_command_flag = 0;           /* QEMUからゲストへの要求フラグ (1:収集, 2:退避, 3:再開) */
+volatile int  mongo_done_flag    = 0;           /* ゲストからの応答ステータス (1:成功, 0:未完了, その他:エラー) */
+QemuSemaphore mongo_clear_sem;                  /* ゲスト側処理の完了をQEMU側で待機・起床するためのセマフォ */
+static bool   mongo_sem_initialized = false;    /* セマフォの二重初期化によるメモリリークやクラッシュを防ぐフラグ */
+
+/* --- 3. 計測・統計 (実験メトリクス) 関連 --- */
+uint64_t actual_skipped_pages = 0;              /* 提案手法によって実際にパケット送信をスキップできたページ数 */
+uint64_t total_canceled_pages = 0;              /* ゲストの再書き込み等によりスキップ判定を破棄(再送)したページ数 */
+double   mig_cpu_start        = 0.0;            /* QEMU移送スレッドのベースラインCPU時間 (開始時・秒) */
+double   mig_cpu_end          = 0.0;            /* QEMU移送スレッドの完了時CPU時間 (終了時・秒) */
 
 #if defined(__linux__)
 #include "qemu/userfaultfd.h"
@@ -447,75 +465,12 @@ static RAMState *ram_state;
 
 static NotifierWithReturnList precopy_notifier_list;
 
-static unsigned long *skip_bitmap = NULL; // MongoDBキャッシュクリアでスキップするページを管理するビットマップ
-static uint64_t skip_bitmap_size = 0;
-uint64_t actual_skipped_pages = 0; // 実際にスキップされたページ数をカウントする変数
-uint64_t total_canceled_pages = 0; // MongoDBからの指令で転送をキャンセルしたページの総数 (実験用に保持しているが、現状は使用していない)
-volatile int mongo_command_flag = 0; // MongoDBへの指令フラグ (0:なし, 1:クリア実行せよ)
-volatile int mongo_done_flag = 0; // 完了ステータス (0:未完了, 1:完了, 2:タイムアウト/エラー)
-QemuMutex skip_list_mutex;
-QemuSemaphore mongo_clear_sem; // MongoDBキャッシュクリア完了待ち用のセマフォ
-
-// 内部呼び出し用の共通ダンプ処理
-static void dump_memory_hex(uint64_t gpa, char *hva, uint64_t len)
-{
-    if (hva) {
-        printf("           Guest Memory Dump (GPA: %#llx, HVA: %#llx):\n           ", (unsigned long long)gpa, (unsigned long long)hva);
-        for (int i = 0; i < len; i++) {
-            printf("%02x ", (unsigned char)hva[i]);
-            if ((i + 1) % 32 == 0) printf("\n           ");
-        }
-        printf("\n");
-    } else printf("           Failed to map GPA to HVA.\n");
-}
-
-// QEMU側でHVAが判明している場合に直接そのポインタから1ページ分の中身をダンプするデバッグ関数
-void dump_guest_memory_from_host(uint64_t gpa, void *host_ptr)
-{
-    dump_memory_hex(gpa, (char *)host_ptr, TARGET_PAGE_SIZE);
-}
-
-// GPAをHVAに変換し，そのページの中身をダンプするデバッグ関数
-void dump_guest_memory_from_gpa(uint64_t gpa)
-{
-    uint64_t read_len = TARGET_PAGE_SIZE;
-    char *hva = cpu_physical_memory_map(gpa, &read_len, false);
-    dump_memory_hex(gpa, hva, read_len);
-    if (hva) cpu_physical_memory_unmap(hva, read_len, false, read_len);
-}
-
 /* ライブ移送時のMongoDB連携用リソースを一括初期化する関数．*/
 void ram_mongo_migration_init(void)
 {
     qemu_sem_init(&mongo_clear_sem, 0); // 同期機構の初期化
     mongo_done_flag = 0; 
-    qemu_mutex_init(&skip_list_mutex); // データ競合を防ぐための排他ロック初期化
-    // スキップ用ビットマップの初期化
-    if (!skip_bitmap) {
-        // 全RAM容量からページ数を計算．この時点で ram_bytes_total() が正しい値を返す必要がある
-        skip_bitmap_size = ram_bytes_total() >> TARGET_PAGE_BITS;
-        skip_bitmap = bitmap_new(skip_bitmap_size);
-    }
-    bitmap_zero(skip_bitmap, skip_bitmap_size); // ビットマップの初期化
     actual_skipped_pages = 0; // スキップ数カウンタのリセット
-}
-
-/*
- * MongoDBから通知された転送をスキップするページのまとまりを受け取り,
- * 転送スキップ用ビットマップへ一括でフラグを立てる関数.
- */
-int set_skip_bitmap_bulk(RamSkipItem *new_items, size_t new_count)
-{
-    if (!skip_bitmap) return -1; // ビットマップが未確保ならエラー
-    qemu_mutex_lock(&skip_list_mutex);
-    for (size_t i = 0; i < new_count; i++) {
-        uint64_t page_idx = new_items[i].ram_offset >> TARGET_PAGE_BITS;
-        if (page_idx < skip_bitmap_size) { // 安全のための範囲チェック
-            set_bit(page_idx, skip_bitmap); // 問答無用でビットを立てる (O(1)かつ分岐なし)
-        }
-    }
-    qemu_mutex_unlock(&skip_list_mutex);
-    return 0;
 }
 
 /* Whether postcopy has queued requests? */
@@ -1043,14 +998,15 @@ static uint64_t physical_memory_sync_dirty_bitmap(RAMBlock *rb,
                 unsigned long bits = qatomic_xchg(&src[idx][offset], 0);
 
                 // 再利用検知とスキップキャンセル
-                if (sync_count > 1 && skip_bitmap && strcmp(rb->idstr, "pc.ram") == 0) {
-                    if (test_bit(k, skip_bitmap)) {
-                        // ゲストが再書き込みした = メモリが再利用されたか、Evictが不完全だった
-                        // スキップをキャンセルし、通常のダーティページとして転送させる
-                        clear_bit(k, skip_bitmap);
-                        total_canceled_pages++; // キャンセル数をカウント
+                if (sync_count > 1 && mongo_shared_bitmap && strcmp(rb->idstr, "pc.ram") == 0) {
+                    uint64_t byte_idx = k / 8;
+                    uint8_t bit_mask = 1 << (k % 8);
+                    // ゲストの再書き込み(メモリ再利用)を検知するため、アトミックにビットを確認・クリア
+                    if (__sync_fetch_and_and(&mongo_shared_bitmap[byte_idx], (uint8_t)~bit_mask) & bit_mask) {
+                        total_canceled_pages++;
                     }
                 }
+
                 unsigned long new_dirty;
                 new_dirty = ~dest[k];
                 dest[k] |= bits;
@@ -2287,21 +2243,6 @@ out:
     return ret;
 }
 
-/*
- * 指定されたRAMBlockのオフセットがスキップ対象か判定する関数．
- * 他ブロックとのオフセット衝突を防ぐため，メインメモリ("pc.ram")のみを対象とする．
- */
-/*
-static bool is_ram_offset_in_skiplist(RAMBlock *block, uint64_t ram_offset)
-{
-    // 未初期化、またはメインメモリ以外の場合は直ちに false を返す
-    if (!skip_bitmap || strcmp(block->idstr, "pc.ram") != 0) return false;
-    uint64_t page_idx = ram_offset >> TARGET_PAGE_BITS;
-    // 範囲内に収まっている場合のみ、ビットの状態を返却する (O(1))
-    return (page_idx < skip_bitmap_size) && test_bit(page_idx, skip_bitmap);
-}
-*/
-
 /* 転送対象ページがクリーン(転送不要)かアトミックに確認・消費し、送信スキップを判定する */
 // PCMachineState 構造体から below_4g_mem_size の値を動的に取得するロジック(pc_piix.c内のpc_init1参照)
 bool consume_skipbitmap_token(RAMBlock *block, uint64_t ram_offset)
@@ -3238,20 +3179,6 @@ static bool mapped_ram_read_header(QEMUFile *file, MappedRamHeader *header,
     return true;
 }
 
-double cpu_start, cpu_end;
-/* CPU時間（ユーザー + システム）を秒単位(double)で返す関数 */
-static double get_process_cpu_time(void)
-{
-    struct rusage usage;
-    if (getrusage(RUSAGE_SELF, &usage) == 0) {
-        return (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) + 
-               (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1000000.0;
-    }
-    return 0.0;
-}
-
-double mig_cpu_start = 0.0, mig_cpu_end = 0.0;
-
 /* QEMU側のマイグレーションスレッド単体が消費した純粋なCPU時間を取得(秒) */
 double get_mig_thread_cpu_time(void)
 {
@@ -3263,9 +3190,6 @@ double get_mig_thread_cpu_time(void)
     }
     return 0.0;
 }
-
-// 初期化済みかどうかを判定するフラグ
-static bool mongo_sem_initialized = false;
 
 // 確実な初期化を保証する関数
 static void ensure_mongo_sync_initialized(void)
@@ -3744,7 +3668,6 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
 
     trace_ram_save_complete(rs->migration_dirty_pages, 1);
 
-    cpu_end = get_process_cpu_time();
     mig_cpu_end = get_mig_thread_cpu_time();
 
     return qemu_fflush(f);
