@@ -136,7 +136,7 @@ void dump_guest_memory_from_gpa(uint64_t gpa);
 void dump_guest_memory_from_host(uint64_t gpa, void *host_ptr);
 bool consume_skipbitmap_token(RAMBlock *block, uint64_t ram_offset);
 void output_migration_experiment_results(void);
-double get_host_cpu_time(void);
+double get_mig_thread_cpu_time(void);
 extern QemuSemaphore mongo_clear_sem;
 extern volatile int mongo_clear_status;
 // 実験用：MongoDBキャッシュクリア同期機能のON/OFFスイッチ

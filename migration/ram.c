@@ -68,14 +68,9 @@
 
 #include <sys/resource.h>
 
-
-#define WT_HDR_SKIP_SIZE 64
-
-// MongoDBとの共有ビットマップ用グローバルポインタ
-uint8_t *mongo_shared_bitmap = NULL;
-size_t mongo_bitmap_size = 8 * 1024 * 1024; 
-
-uint64_t total_canceled_pages = 0;
+#define WT_HDR_SKIP_SIZE 64 // Write Trackingのヘッダ部分のサイズ (バイト単位)
+uint8_t *mongo_shared_bitmap = NULL; // MongoDBとの共有ビットマップ用グローバルポインタ
+size_t mongo_bitmap_size = 8 * 1024 * 1024; // 8MBのビットマップで，最大64GBのRAMを管理可能
 
 #if defined(__linux__)
 #include "qemu/userfaultfd.h"
@@ -455,6 +450,7 @@ static NotifierWithReturnList precopy_notifier_list;
 static unsigned long *skip_bitmap = NULL; // MongoDBキャッシュクリアでスキップするページを管理するビットマップ
 static uint64_t skip_bitmap_size = 0;
 uint64_t actual_skipped_pages = 0; // 実際にスキップされたページ数をカウントする変数
+uint64_t total_canceled_pages = 0; // MongoDBからの指令で転送をキャンセルしたページの総数 (実験用に保持しているが、現状は使用していない)
 volatile int mongo_command_flag = 0; // MongoDBへの指令フラグ (0:なし, 1:クリア実行せよ)
 volatile int mongo_done_flag = 0; // 完了ステータス (0:未完了, 1:完了, 2:タイムアウト/エラー)
 QemuMutex skip_list_mutex;
@@ -2306,41 +2302,23 @@ static bool is_ram_offset_in_skiplist(RAMBlock *block, uint64_t ram_offset)
 }
 */
 
+/* 転送対象ページがクリーン(転送不要)かアトミックに確認・消費し、送信スキップを判定する */
 // PCMachineState 構造体から below_4g_mem_size の値を動的に取得するロジック(pc_piix.c内のpc_init1参照)
 bool consume_skipbitmap_token(RAMBlock *block, uint64_t ram_offset)
 {
-    // 未初期化、またはメインメモリ ("pc.ram") 以外の場合はスキップしない
-    if (!mongo_shared_bitmap || strcmp(block->idstr, "pc.ram") != 0) {
-        return false;
-    }
+    // 共有ビットマップ未初期化、またはメインメモリ("pc.ram")以外はスキップ対象外
+    if (!mongo_shared_bitmap || strcmp(block->idstr, "pc.ram") != 0) return false;
 
-    uint64_t gpa;
-    // PCIホールの設定 (標準的なQEMU PCマシンの場合: 3GB〜4GBがホール)
-    uint64_t pci_hole_start = 0xC0000000; // 3GB
-    uint64_t pci_hole_size  = 0x40000000; // 1GB
-
-    // RAM Offset から ゲスト物理アドレス (GPA) を正しく逆算する
-    if (ram_offset < pci_hole_start) {
-        gpa = ram_offset;
-    } else {
-        gpa = ram_offset + pci_hole_size;
-    }
-
-    // GPA から ゲスト物理ページ番号 (GPFN) を算出
+    // RAMオフセットからPCIホール(3GB~4GB)を考慮してゲスト物理アドレス(GPA)を逆算
+    uint64_t gpa = ram_offset + (ram_offset >= 0xC0000000 ? 0x40000000 : 0);
     uint64_t gpfn = gpa >> TARGET_PAGE_BITS;
 
-    // ビットマップの範囲外ならスキップしない
+    // GPFNがビットマップの管理範囲外ならスキップしない
     if (gpfn >= (mongo_bitmap_size * 8)) return false;
 
-    // WiredTiger側と同じロジックでビットの状態を確認
-    uint64_t byte_idx = gpfn / 8;
-    uint8_t bit_mask = 1 << (gpfn % 8);
-
-    // 読み取ると同時に 0 にクリアする
-    uint8_t old_val = __sync_fetch_and_and(&mongo_shared_bitmap[byte_idx], (uint8_t)(~bit_mask));
-
-    // 該当ビットが 1 (Clean) なら true を返す
-    return (old_val & bit_mask) != 0;
+    // 該当ページのクリーン状態をアトミックに読み取りつつ，消費(0クリア)する
+    uint8_t mask = 1 << (gpfn % 8);
+    return (__sync_fetch_and_and(&mongo_shared_bitmap[gpfn / 8], ~mask) & mask) != 0;
 }
 
 /**
@@ -2368,7 +2346,8 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
 {
     bool page_dirty, preempt_active = postcopy_preempt_active();
     int tmppages, pages = 0;
-    size_t pagesize_bits = qemu_ram_pagesize(pss->block) >> TARGET_PAGE_BITS;
+    size_t pagesize_bits =
+        qemu_ram_pagesize(pss->block) >> TARGET_PAGE_BITS;
     unsigned long start_page = pss->page;
     int res;
 
@@ -2385,55 +2364,41 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
 
         /* Check the pages is dirty and if it is send it */
         if (page_dirty) {
-            bool should_skip = false;
-            uint64_t offset_in_block = ((ram_addr_t)pss->page << TARGET_PAGE_BITS);
 #if ENABLE_MONGO_SYNC_EXPERIMENT
+            uint64_t offset_in_block = ((ram_addr_t)pss->page) << TARGET_PAGE_BITS;
+            // MongoDBの共有ビットマップに基づき，クリーンページならスキップヘッダのみ送信
             if (consume_skipbitmap_token(pss->block, offset_in_block)) {
-                // ダウンタイム中(last_stage)なのにスキップしようとしたら警告してキャンセル
-                if (rs->last_stage) {
-                    fprintf(stderr, "[MONGO-FATAL] Skipped page during downtime! Offset: 0x%lx\n", offset_in_block);
-                    should_skip = false;
-                } else {
-                    // プレコピー中なら、MongoDBの正確なビットマップを完全に信頼してスキップ
-                    should_skip = true;
-                }
-            } else {
-                // ビットマップが 0 なら通常通り送信
-                should_skip = false;
-            }
-#endif /* ENABLE_MONGO_SYNC_EXPERIMENT */
-            if (should_skip) {
                 uint8_t *p = pss->block->host + offset_in_block;
-                tmppages = 1; 
-                pages += tmppages;
-                ram_addr_t offset = ((ram_addr_t)pss->page) << TARGET_PAGE_BITS;
-                // ヘッダを送信
-                ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset | RAM_SAVE_FLAG_SKIPPED));
+                pages++;
+                
+                ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset_in_block | RAM_SAVE_FLAG_SKIPPED));
                 qemu_put_buffer(pss->pss_channel, p, WT_HDR_SKIP_SIZE);
                 actual_skipped_pages++;
-            } else {
+            } else 
+#endif /* ENABLE_MONGO_SYNC_EXPERIMENT */
+            {
+            /*
+             * Properly yield the lock only in postcopy preempt mode
+             * because both migration thread and rp-return thread can
+             * operate on the bitmaps.
+             */
+            if (preempt_active) {
+                qemu_mutex_unlock(&rs->bitmap_mutex);
+            }
+            tmppages = ram_save_target_page(rs, pss);
+            if (tmppages >= 0) {
+                pages += tmppages;
                 /*
-                 * Properly yield the lock only in postcopy preempt mode
-                 * because both migration thread and rp-return thread can
-                 * operate on the bitmaps.
+                 * Allow rate limiting to happen in the middle of huge pages if
+                 * something is sent in the current iteration.
                  */
-                if (preempt_active) {
-                    qemu_mutex_unlock(&rs->bitmap_mutex);
+                if (pagesize_bits > 1 && tmppages > 0) {
+                    migration_rate_limit();
                 }
-                tmppages = ram_save_target_page(rs, pss);
-                if (tmppages >= 0) {
-                    pages += tmppages;
-                    /*
-                     * Allow rate limiting to happen in the middle of huge pages if
-                     * something is sent in the current iteration.
-                     */
-                    if (pagesize_bits > 1 && tmppages > 0) {
-                        migration_rate_limit();
-                    }
-                }
-                if (preempt_active) {
-                    qemu_mutex_lock(&rs->bitmap_mutex);
-                }
+            }
+            if (preempt_active) {
+                qemu_mutex_lock(&rs->bitmap_mutex);
+            }
             }
         } else {
             tmppages = 0;
@@ -2653,7 +2618,7 @@ static void ram_save_cleanup(void *opaque)
     if (mongo_shared_bitmap != NULL) {
         munmap(mongo_shared_bitmap, mongo_bitmap_size);
         mongo_shared_bitmap = NULL;
-        fprintf(stderr, "[Migration] Info: mongo_bitmap unmapped.\n");
+        fprintf(stderr, "[MIG-INFO] mongo_bitmap unmapped.\n");
     }
 #endif
 
@@ -3285,15 +3250,16 @@ static double get_process_cpu_time(void)
     return 0.0;
 }
 
-/* ホストのCPU時間を秒単位(double)で返す関数 */
-double host_cpu_start, host_cpu_end;
-/* CPU時間（ユーザー + システム）を秒単位(double)で返す関数 */
-double get_host_cpu_time(void)
+double mig_cpu_start = 0.0, mig_cpu_end = 0.0;
+
+/* QEMU側のマイグレーションスレッド単体が消費した純粋なCPU時間を取得(秒) */
+double get_mig_thread_cpu_time(void)
 {
     struct rusage usage;
+    // プロセス全体(RUSAGE_SELF)のノイズを排除し、現在のスレッドのみ計測
     if (getrusage(RUSAGE_THREAD, &usage) == 0) {
         return (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) + 
-               (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1000000.0;
+               (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
     }
     return 0.0;
 }
@@ -3309,85 +3275,69 @@ static void ensure_mongo_sync_initialized(void)
         mongo_sem_initialized = true;
     }
 }
-/*  wait_for_mongo_migration_action --
- * MongoDBに対してページの収集や退避を実行させる
- * mongo_command_flag = 1: 移送開始時にスキップするページを収集する
- * mongo_command_flag = 2: ダウンタイム直前にページを退避する
- * mongo_command_flag = 3: 移送先での再開
- */
+
+/* MongoDBへメモリ収集・退避・再開コマンドを発行し、必要に応じてBQLを管理して完了を待つ */
 void wait_for_mongo_migration_action(int flag)
 {
-    // ★ 使う前に絶対に初期化を保証する
-    ensure_mongo_sync_initialized();
-
-    if (flag == 1) {
-        printf("MongoSync [Phase 1]: Triggering and waiting for page collection...\n");
-    } else if (flag == 2) {
-        printf("MongoSync [Phase 3]: Triggering and waiting for cache eviction...\n");
-    } else if (flag == 3) {
-        printf("MongoSync [Phase 4]: Triggering resume signal to target DB (Async)...\n");
-    } else {
-        printf("MongoSync: Triggering unknown action (%d)...\n", flag);
-    }
+    ensure_mongo_sync_initialized(); // 共有メモリ等の初期化状態を保証
 
     mongo_done_flag = 0;
-    mongo_command_flag = flag; // ゲスト側にポーリングさせているフラグをONにする
+    mongo_command_flag = flag; // ゲストのポーリング用フラグ(1:収集, 2:退避, 3:再開)をセット
 
-    // ==========================================================
-    // ★ 超重要: フェーズ4(移送先での再開)はここで処理を終了する！
-    // QEMUのメインループをブロック（デッドロック）させないための早期リターン
-    // ==========================================================
-    if (flag == 3) return; 
-
-    // --- これ以降は「待機」が必要なフェーズ1, 2（移送元）でのみ実行される ---
-
-    bool locked = bql_locked(); // 現在の呼び出し元スレッドがBQLを持っているか確認
-
-    // BQLを持っている場合のみ、ゲストを動かすためにアンロックする
-    if (locked) {
-        bql_unlock(); 
+    if (flag == 3) {
+        // 移送先での再開通知はQEMUをブロック(デッドロック)させないよう即座にリターン
+        fprintf(stderr, "[MIG-INFO] Signal 3 (Resume) sent async.\n");
+        return;
     }
+    fprintf(stderr, "[MIG-INFO] Signal %d sent. Waiting for guest...\n", flag);
+
+    // ゲストVMにCPU時間を割り当てて処理を進めさせるため，QEMU大域ロック(BQL)を一時解放
+    bool locked = bql_locked(); // 現在のスレッドがBQLを保持しているか確認
+    if (locked) bql_unlock(); // BQLを持っている場合のみ，ゲストを動かすためにアンロックする
     
-    // ゲストからの完了通知を待機
-    qemu_sem_wait(&mongo_clear_sem); 
+    qemu_sem_wait(&mongo_clear_sem); // ゲスト(MongoDB側)からの処理完了セマフォを待機
 
-    // 元々BQLを持っていた場合のみ、取り戻す
-    if (locked) {
-        bql_lock(); 
-    }
+    if (locked) bql_lock(); // 待機完了後、BQLを元の状態に復元
 
-    if (mongo_done_flag == 1) {
-        if (flag == 1) {
-            // 収集完了時は登録されたページ数を表示
-            printf("MongoSync [Phase 1]: Done. Registered skip pages: %zu\n", 
-                   bitmap_count_one(skip_bitmap, skip_bitmap_size));
-        } else if (flag == 2) {
-            // 退避完了時はシンプルに完了を通知
-            printf("MongoSync [Phase 3]: Done. Eviction completed safely.\n");
+    // 処理完了のロギングと後始末
+    if (flag == 1 && mongo_done_flag == 1) {
+        // mongo_shared_bitmap (uint8_t配列) から実際にセットされたビットを数える
+        size_t skip_count = 0;
+        if (mongo_shared_bitmap) {
+            for (size_t i = 0; i < mongo_bitmap_size; i++) {
+                // __builtin_popcount は整数の2進数表現における '1' の数を高速にカウントする
+                skip_count += __builtin_popcount(mongo_shared_bitmap[i]);
+            }
         }
+        fprintf(stderr, "[MIG-INFO] Signal 1 done. Skip pages: %zu\n", skip_count);
+        actual_skipped_pages = 0;
+    } else if (flag == 2 && mongo_done_flag == 1) {
+        fprintf(stderr, "[MIG-INFO] Signal 2 done. Eviction complete.\n");
     } else {
-        printf("MongoSync: Done (Unknown status).\n");
+        fprintf(stderr, "[MIG-INFO] Signal %d done (Status: %d).\n", flag, mongo_done_flag);
     }
-    if (flag == 1) actual_skipped_pages = 0;
 }
 
+/* QEMUとMongoDB間で転送スキップ判定を共有するためのIVSHMEMを読み書き両用でマッピングする関数 */
 void mmap_shared_bitmap(void)
 {
-    // 1. O_RDONLY を O_RDWR に変更（読み書き両用で開く）
+    // 読み書き両用で開く
     int fd = open("/dev/shm/mongo_bitmap", O_RDWR);
-    if(fd >= 0) {
-        // 2. PROT_READ に PROT_WRITE を追加
-        mongo_shared_bitmap = mmap(NULL, mongo_bitmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        close(fd);
-        if (mongo_shared_bitmap == MAP_FAILED) {
-            mongo_shared_bitmap = NULL;
-            fprintf(stderr, "[Migration] Warning: Failed to mmap /dev/shm/mongo_bitmap\n");
-        } else {
-            fprintf(stderr, "[Migration] Success: mongo_bitmap mapped for Zero-Copy skip (Read/Write)!\n");
-                   }
+    if (fd < 0) {
+        // 共有メモリが存在しない場合は，IVSHMEM非使用の標準マイグレーションへフォールバック
+        fprintf(stderr, "[MIG-INFO] mongo_bitmap not found. Running normal mode.\n");
+        return;
+    }
+    // ゲストが更新したスキップ判定をアトミックに消費(R/W)するため、共有メモリとしてマップ
+    mongo_shared_bitmap = mmap(NULL, mongo_bitmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+
+    if (mongo_shared_bitmap == MAP_FAILED) {
+        mongo_shared_bitmap = NULL;
+        // マップ失敗時はOSの具体的なエラー理由(errno)を併記して警告
+        fprintf(stderr, "[MIG-WARN] Failed to mmap mongo_bitmap: %s\n", strerror(errno));
     } else {
-        // IVSHMEMを使わない通常のマイグレーション時はここを通る
-        fprintf(stderr, "[Migration] Info: /dev/shm/mongo_bitmap not found. Running normal mode.\n");
+        fprintf(stderr, "[MIG-INFO] mongo_bitmap mapped for Zero-Copy skip.\n");
     }
 }
 
@@ -3413,19 +3363,13 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
     RAMBlock *block;
     int ret, max_hg_page_size;
 
+    mig_cpu_start = get_mig_thread_cpu_time(); // 移送開始時点のQEMU移送スレッドの純粋なCPU時間を記録
 #if ENABLE_MONGO_SYNC_EXPERIMENT
-    mmap_shared_bitmap();
-    // MongoDB連携機能の初期化
-    ram_mongo_migration_init();   // RAMマイグレーション側のデータ構造初期化
-    //移送開始前のCPU時間を取得
-    cpu_start = get_process_cpu_time();
-    host_cpu_start = get_host_cpu_time(); 
-    wait_for_mongo_migration_action(1); // 実験用：MongoDBのキャッシュクリア完了を待機する関数を呼び出し
+    mmap_shared_bitmap(); // スキップ判定用の共有メモリをマップ
+    ram_mongo_migration_init(); // QEMU側のビットマップ管理用データ構造を初期化
+    wait_for_mongo_migration_action(1); // ゲストDBへPhase 1(クリーンページ収集)を要求し完了を待機
 #else
-    //移送開始前のCPU時間を取得
-    printf("MongoSync: [OFF] Skipped.\n");
-    cpu_start = get_process_cpu_time();
-    host_cpu_start = get_host_cpu_time(); 
+    printf("[MIG-INFO] Running normal precopy.\n");
 #endif
 
     /* migration has already setup the bitmap, reuse it. */
@@ -3457,7 +3401,6 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
             if (migrate_ignore_shared()) {
                 qemu_put_be64(f, block->mr->addr);
             }
-
             if (migrate_mapped_ram()) {
                 mapped_ram_setup_ramblock(f, block);
             }
@@ -3531,6 +3474,7 @@ static void ram_save_file_bmap(QEMUFile *f)
         if (migrate_ram_is_ignored(block)) {
             continue;
         }
+
         long num_pages = block->used_length >> TARGET_PAGE_BITS;
         long bitmap_size = BITS_TO_LONGS(num_pages) * sizeof(unsigned long);
 
@@ -3668,62 +3612,52 @@ out:
     return done;
 }
 
-// 実験用：移送完了時の結果出力とCSVへの記録
+/* 実験完了時のメトリクスをCSVに追記し、サマリを表示する関数 */
 void output_migration_experiment_results(void)
 {
-    double cpu_time = cpu_end - cpu_start;
-    double host_cpu_time = host_cpu_end - host_cpu_start;
+    MigrationState *s = migrate_get_current();
+    const char *csv_path = "/home/mitsuki/migration_log.csv";
+    
     double tx_gb = (stat64_get(&mig_stats.qemu_file_transferred) + 
                     stat64_get(&mig_stats.multifd_bytes) + 
                     stat64_get(&mig_stats.rdma_bytes)) / (1024.0 * 1024.0 * 1024.0);
-    MigrationState *s = migrate_get_current();
-    const char *csv_path = "/home/mitsuki/migration_log.csv";
+    uint64_t skip_bytes = actual_skipped_pages * TARGET_PAGE_SIZE;
 
-    // 1. CSVファイルへの出力
+    // CSVファイルを追記モードで開き、空ファイル(新規作成)時のみヘッダーを書き込む
     FILE *fp = fopen(csv_path, "a");
     if (fp) {
         fseek(fp, 0, SEEK_END);
-        if (ftell(fp) == 0) { // 新規ファイル時のみヘッダー出力
-            fprintf(fp, "CPU_Time(sec),Setup_Time(ms),Transferred(GB),Normal_Pages,Dirty_Syncs\n");
+        if (ftell(fp) == 0) {
+            fprintf(fp, "QEMU_Mig_CPU(sec),Setup_Time(ms),Transferred(GB),Normal_Pages,Dirty_Syncs\n");
         }
         fprintf(fp, "%.6f,%" PRId64 ",%.2f,%" PRIu64 ",%" PRIu64 "\n",
-                cpu_time, s->setup_time, tx_gb,
+                mig_cpu_end - mig_cpu_start, s->setup_time, tx_gb,
                 stat64_get(&mig_stats.normal_pages), stat64_get(&mig_stats.dirty_sync_count));
         fclose(fp);
-        printf("CSV log saved to %s\n", csv_path);
     }
 
-    // 2. 標準出力への結果表示
-    uint64_t skipped_bytes = actual_skipped_pages * TARGET_PAGE_SIZE;
-    // 移送完了時刻の取得と出力
+    // 移送完了時刻を取得し、ミリ秒精度まで文字列としてフォーマット
     struct timeval tv;
     struct tm tm_info;
     char time_buf[32];
-
     gettimeofday(&tv, NULL);
     localtime_r(&tv.tv_sec, &tm_info);
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
-    printf("=========================================\n"
-           "Migration Complete Result:\n"
-           "Migration Completed at: %s.%03d\n"
-           //"Total Migration CPU Time: %.6f sec\n"
-           "Host CPU Time: %.6f sec\n"
-           //"  Registered Skip GPAs : %zu pages\n"
-           "  Actually Skipped     : %lu pages\n"
-           "  True Dirty Canceled  : %lu pages\n"
-           "  Skipped Size         : %lu bytes\n"
-           //"                       : %.2f MB\n"
-           "                       : %.2f GB\n"
-           "=========================================\n",
-           time_buf, (int)(tv.tv_usec / 1000),
-           //cpu_time,
-           host_cpu_time,
-           //bitmap_count_one(skip_bitmap, skip_bitmap_size),
-           actual_skipped_pages,
-           total_canceled_pages,
-           skipped_bytes,
-           //skipped_bytes / (1024.0 * 1024.0),
-           skipped_bytes / (1024.0 * 1024.0 * 1024.0));
+
+    printf( "=== Migration Complete Result ===\n"
+            " Completed at      : %s.%03d\n"
+            " QEMU Mig CPU Time : %.6f sec\n"
+            " Actually Skipped  : %lu pages\n"
+            " True Dirty Cancel : %lu pages\n"
+            " Skipped Size      : %.2f GB (%lu bytes)\n"
+            " CSV log saved to  : %s\n"
+            " =================================\n",
+            time_buf, (int)(tv.tv_usec / 1000), 
+            mig_cpu_end - mig_cpu_start,
+            actual_skipped_pages, 
+            total_canceled_pages,
+            skip_bytes / (1024.0 * 1024.0 * 1024.0), skip_bytes,
+            csv_path);
 }
 
 /**
@@ -3811,7 +3745,7 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
     trace_ram_save_complete(rs->migration_dirty_pages, 1);
 
     cpu_end = get_process_cpu_time();
-    host_cpu_end = get_host_cpu_time();
+    mig_cpu_end = get_mig_thread_cpu_time();
 
     return qemu_fflush(f);
 }
@@ -4687,19 +4621,19 @@ static int ram_load_precopy(QEMUFile *f)
     MigrationIncomingState *mis = migration_incoming_get_current();
     int flags = 0, ret = 0, invalid_flags = 0, i = 0;
 
+    // 1秒ごとの統計処理（静的変数で状態とファイルポインタを保持）
     static int64_t last_log_time = 0;
     static double last_cpu = 0.0;
     static int elapsed_sec = 0;
+    static FILE *csv_fp = NULL;
 
-    // 初回のみ初期化
+    // 初回呼び出し時のみ、CSVファイルを開きっぱなしにして行バッファリングを有効化
     if (last_log_time == 0) {
         last_log_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-        last_cpu = get_host_cpu_time();
-        
-        FILE *fp = fopen("/tmp/qemu_metrics.csv", "w");
-        if (fp) {
-            fprintf(fp, "Seconds,CPU_Usage(%%)\n"); // Bandwidthのカラムを削除
-            fclose(fp);
+        last_cpu = get_mig_thread_cpu_time();
+        if ((csv_fp = fopen("/tmp/qemu_metrics.csv", "w"))) {
+            setvbuf(csv_fp, NULL, _IOLBF, 0); // 改行のたびに自動でディスクへ書き出し
+            fprintf(csv_fp, "Seconds,CPU_Usage(%%)\n");
         }
     }
     if (migrate_mapped_ram()) {
@@ -4709,21 +4643,16 @@ static int ram_load_precopy(QEMUFile *f)
     }
 
     while (!ret && !(flags & RAM_SAVE_FLAG_EOS)) {
-        // ★追加: 1秒ごとの統計処理（ループ内で毎回チェック）
+        // 1秒経過時のメトリクス計算と、開きっぱなしのCSVへの直接追記（I/Oブロックなし）
         int64_t current_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
         if (current_time - last_log_time >= 1000) {
-            double current_cpu = get_host_cpu_time();
-            double cpu_usage_percent = (current_cpu - last_cpu) * 100.0;
-            elapsed_sec++;
-
-            FILE *fp = fopen("/tmp/qemu_metrics.csv", "a");
-            if (fp) {
-                fprintf(fp, "%d,%.2f\n", elapsed_sec, cpu_usage_percent);
-                fclose(fp);
+            double current_cpu = get_mig_thread_cpu_time();
+            
+            if (csv_fp) {
+                // 計算とインクリメントを直接fprintfに埋め込んで高速化
+                fprintf(csv_fp, "%d,%.2f\n", ++elapsed_sec, (current_cpu - last_cpu) * 100.0);
             }
-
             last_log_time = current_time;
-            last_cpu = current_cpu;
         }
 
         ram_addr_t addr;
@@ -4872,6 +4801,7 @@ static int ram_load_precopy(QEMUFile *f)
             memcpy(host_bak, host, TARGET_PAGE_SIZE);
         }
     }
+
     return ret;
 }
 
