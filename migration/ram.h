@@ -60,7 +60,8 @@
 #define RAM_SAVE_FLAG_XBZRLE                  0x040
 #define RAM_SAVE_FLAG_HOOK                    0x080
 #define RAM_SAVE_FLAG_MULTIFD_FLUSH           0x200
-#define RAM_SAVE_FLAG_SKIPPED                 0x400 //受信側にビットマップを送るならRAM_SAVE_FLAG_SKIP_BITMAP 0x100が必要かも
+#define RAM_SAVE_FLAG_METADATA                0x100 // 移送開始時に転送するメタデータに関するフラグ
+#define RAM_SAVE_FLAG_SKIPPED                 0x400 // 転送をスキップするしたことを受信側に通知するフラグ
 
 extern XBZRLECacheStats xbzrle_counters;
 

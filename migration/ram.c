@@ -90,6 +90,36 @@ uint64_t total_canceled_pages = 0;              /* ゲストの再書き込み�
 double   mig_cpu_start        = 0.0;            /* QEMU移送スレッドのベースラインCPU時間 (開始時・秒) */
 double   mig_cpu_end          = 0.0;            /* QEMU移送スレッドの完了時CPU時間 (終了時・秒) */
 
+/* --- 4. スレッドに渡すための引数パッケージ --- */
+typedef struct {
+    uint8_t *metadata;
+    size_t size;
+} MongoPrefetchArgs;
+
+// スキップページ復元機構
+/* --- 5. スキップページ復元機構 --- */
+/* 1. ディスク上のブロックメタデータ（最下層） */
+typedef struct __attribute__((packed)) {
+    uint64_t offset;   // ファイル内の物理オフセット (QEMUがpreadで先読みするため)
+    uint32_t size;     // ディスク上の圧縮ブロックサイズ
+} BlockMeta;
+
+/* 2. ファイルごとのメタデータグループ（中間層） */
+typedef struct {
+    char f_name[128];       // 復元する対象のファイル名
+    uint32_t block_num;     // このファイルから復元するブロック数
+    uint32_t block_capacity;// 動的拡張のためのキャパシティ
+    BlockMeta *blocks;      // 復元するブロックのメタデータ配列へのポインタ
+} FileGroupMeta;
+
+/* 3. 全体を管理するルート構造体（最上位） */
+typedef struct {
+    uint32_t file_num;      // 対象となるファイルの総数
+    uint32_t file_capacity; // 動的拡張のためのキャパシティ
+    FileGroupMeta *files;   // 各ファイルグループの配列へのポインタ
+} GlobalRestoreMeta;
+
+
 #if defined(__linux__)
 #include "qemu/userfaultfd.h"
 #endif /* defined(__linux__) */
@@ -458,6 +488,10 @@ struct RAMState {
      * Protected by @bitmap_mutex.
      */
     PageLocationHint page_hint;
+    
+    /* MongoDB ライブ移送用のメタデータ状態 */
+    uint8_t *mongo_meta;
+    size_t mongo_meta_size;
 };
 typedef struct RAMState RAMState;
 
@@ -2287,8 +2321,7 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
 {
     bool page_dirty, preempt_active = postcopy_preempt_active();
     int tmppages, pages = 0;
-    size_t pagesize_bits =
-        qemu_ram_pagesize(pss->block) >> TARGET_PAGE_BITS;
+    size_t pagesize_bits = qemu_ram_pagesize(pss->block) >> TARGET_PAGE_BITS;
     unsigned long start_page = pss->page;
     int res;
 
@@ -3200,10 +3233,59 @@ static void ensure_mongo_sync_initialized(void)
     }
 }
 
+/*
+// MongoDBからのメタデータについて指定されたサイズを確実に全量読み取る関数
+static uint8_t* read_exact(int fd, const uint8_t *buf, size_t *size) {
+    size_t read_size = 0;
+    const uint8_t *ptr = buf;      // 現在の読み込み位置
+
+    while (remaining > 0) {
+        // OSに書き込みを依頼
+        ssize_t read = read(fd, ptr, remaining);
+
+        if (read < 0) {
+            // エラー処理
+            if (errno == EINTR) continue; // シグナル割り込みの場合は、もう一度やり直す
+            return -1; // 本当の致命的エラーの場合
+        }
+        if (read == 0) return -1; // EOF (予期せぬ切断)
+
+        // 書き込めた分だけ，ポインタと残りサイズを更新
+        ptr += read;
+        read_size += read;
+    }
+
+    *size = read_size;
+    return 0; // 全量書き込み完了！
+}
+*/
+
 /* MongoDBへメモリ収集・退避・再開コマンドを発行し、必要に応じてBQLを管理して完了を待つ */
 void wait_for_mongo_migration_action(int flag)
 {
     ensure_mongo_sync_initialized(); // 共有メモリ等の初期化状態を保証
+
+    RAMState *rs = ram_state; 
+    if (!rs) return; // 初期化されていない場合の安全策
+
+    int sock_fd = -1;
+    //uint8_t *metadata = NULL;
+    //uint64_t metadata_size = 0;
+
+    // フェーズ１なら，ゲストを動かす前にソケットに接続して待機
+    if (flag == 1) {
+        sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, "/tmp/metadata_port.sock", sizeof(addr.sun_path)-1);
+
+        if (connect(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            fprintf(stderr, "[MIG-ERROR] Failed to connect to metadata socket\n");
+            close(sock_fd);
+            sock_fd = -1;
+        }
+    }
 
     mongo_done_flag = 0;
     mongo_command_flag = flag; // ゲストのポーリング用フラグ(1:収集, 2:退避, 3:再開)をセット
@@ -3225,6 +3307,30 @@ void wait_for_mongo_migration_action(int flag)
 
     // 処理完了のロギングと後始末
     if (flag == 1 && mongo_done_flag == 1) {
+        /*
+        // 収集完了後，ソケットからデータを吸い出す
+        if (sock_fd >= 0) {
+            // 1. 最初にゲストから送られてくるサイズ(8バイト)を読む
+            if (read_exact(sock_fd, (uint8_t*)&metadata_size, sizeof(uint64_t)) == 0) {
+                // 2. 受け取ったサイズ分だけメモリを確保
+                metadata = malloc(metadata_size);
+                if (metadata) {
+                    // 3. 本体を全量読む
+                    if (read_exact(sock_fd, metadata, metadata_size) == 0) {
+                        // RAMState に直接保存
+                        if (rs != NULL) {
+                            rs->mongo_meta = metadata;
+                            rs->mongo_meta_size = metadata_size;
+                        } else {
+                            free(metadata); // 受け皿がなければ捨てる
+                        }
+                    }
+                }
+            }
+            close(sock_fd);
+        }
+            */
+
         // mongo_shared_bitmap (uint8_t配列) から実際にセットされたビットを数える
         size_t skip_count = 0;
         if (mongo_shared_bitmap) {
@@ -3289,9 +3395,32 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
 
     mig_cpu_start = get_mig_thread_cpu_time(); // 移送開始時点のQEMU移送スレッドの純粋なCPU時間を記録
 #if ENABLE_MONGO_SYNC_EXPERIMENT
+    RAMState *rs = *rsp; // QEMU標準の移送状態構造体
+    rs->mongo_meta = NULL;
+    rs->mongo_meta_size = 0;
     mmap_shared_bitmap(); // スキップ判定用の共有メモリをマップ
     ram_mongo_migration_init(); // QEMU側のビットマップ管理用データ構造を初期化
     wait_for_mongo_migration_action(1); // ゲストDBへPhase 1(クリーンページ収集)を要求し完了を待機
+
+    // 構造体にデータが入っていれば送信
+    if (rs->mongo_meta != NULL && rs->mongo_meta_size > 0) {
+        // 1. メタデータフラグ(64bit)を送信
+        qemu_put_be64(f, RAM_SAVE_FLAG_METADATA);
+        // 2. データのサイズ（8バイト）を送信
+        qemu_put_be64(f, (uint64_t)rs->mongo_meta_size);
+        // 3. メタデータ本体（バイト列）をストリームに流し込む
+        qemu_put_buffer(f, rs->mongo_meta, rs->mongo_meta_size);
+        // 4. 転送量を統計情報に追加する処理（8 + 8 + データサイズ）
+        ram_transferred_add(16 + rs->mongo_meta_size);
+        // 5. 送信が終わったら安全に解放し，ポインタをリセット（リーク防止）
+        free(rs->mongo_meta);
+        rs->mongo_meta = NULL;
+        rs->mongo_meta_size = 0;
+
+        fprintf(stderr, "[MIG-INFO] Sent MongoDB Metadata (%lu bytes).\n", rs->mongo_meta_size);
+
+        sleep(10);
+    }
 #else
     printf("[MIG-INFO] Running normal precopy.\n");
 #endif
@@ -4529,6 +4658,88 @@ static int parse_ramblocks(QEMUFile *f, ram_addr_t total_ram_bytes)
     return ret;
 }
 
+/*
+static GlobalRestoreMeta * deserialize_metadata(MongoPrefetchArgs *args)
+{
+    GlobalRestoreMeta* meta = g_new0(GlobalRestoreMeta, 1);
+    uint8_t *ptr = args->metadata;
+
+    // 収集したメタデータのデシリアライズ化    
+    // 1. GlobalRestoreMeta (file_num のみ．capacityはQEMUに不要なので省く)
+    memcpy(&meta->file_num, ptr, sizeof(uint32_t));
+    ptr += sizeof(uint32_t);
+    // FileGroupMetaの配列を確保
+    meta->files = g_new0(FileGroupMeta, meta->file_num);
+
+    // 2. FileGroupMeta のデシリアライズ
+    for (int i = 0; i < meta->file_num; i++) {
+        FileGroupMeta *file = &meta->files[i];
+
+        // ファイル名
+        memcpy(file->f_name, ptr, 128);
+        ptr += 128;
+        
+        // ブロック数
+        memcpy(&file->block_num, ptr, sizeof(uint32_t));
+        ptr += sizeof(uint32_t);
+        
+        // BlockMetaの配列を確保
+        file->blocks = g_new0(BlockMeta, file->block_num);
+
+        // 3. BlockMeta のデシリアライズ
+        size_t blocks_bytes = file->block_num * sizeof(BlockMeta);
+        if (blocks_bytes > 0) {
+            memcpy(file->blocks, ptr, blocks_bytes);
+            ptr += blocks_bytes;
+        }
+    }
+    
+    return meta;
+}
+
+// 生成された別スレッドで独立して動く，並列復元を行うメイン関数
+static void mongo_prefeth_worker(void *opaque)
+{
+    int fd;
+    // 1. 受け取った引数を元の構造体にキャスト
+    MongoPrefetchArgs *args = (MongoPrefetchArgs *)opaque;
+    fprintf(stderr, "[MIG-INFO] Background thread started. Processing %zu bytes.\n", args->size);
+
+    // ----------------------------------------------------
+    // 【Step 3, 4の処理がここに入ります】
+    // - デシリアライズ処理
+    GlobalRestoreMeta *meta = deserialize_metadata(args);
+    // - virtio-fs経由での open() と pread() 連打
+    for (int i = 0; i < meta->file_num; i++) {
+        FileGroupMeta *file = &meta->files[i];
+        fd = open(file->f_name, O_RDONLY);
+        pread(fd, dest_addr, size, file_offset)
+    }
+    // ----------------------------------------------------
+
+    // 2. 使い終わった引数構造体とデータは【必ずこのスレッド内で】解放
+    g_free(args->metadata); // qemu_get_buffer用に確保したメモリ
+    g_free(args);           // 引数パッケージ用のメモリ
+
+    fprintf(stderr, "[MIG-INFO] Background thread finished successfully.\n");
+    return NULL;
+}
+
+// メインスレッドから呼ばれる，並列復元スレッドを生成する関数
+static void launch_mongo_prefetch_thread(uint8_t *metadata, size_t size)
+{
+    // 1. 引数構造体用にメモリを確保し、データを詰める (g_new0 はゼロ埋めして確保)
+    MongoPrefetchArgs *args = g_new0(MongoPrefetchArgs, 1);
+    args->metadata = metadata;
+    args->size = size;
+
+    // 2. QEMUのスレッドオブジェクトを用意
+    QemuThread thread;
+
+    // 3. スレッドを生成(QEMU_THREAD_DETACHED:スレッドを切り離しモードで起動)
+    qemu_thread_create(&thread, "mongo_prefetch", mongo_prefeth_worker, args, QEMU_THREAD_DETACHED);
+}
+*/
 /**
  * ram_load_precopy: load pages in precopy case
  *
@@ -4709,7 +4920,28 @@ static int ram_load_precopy(QEMUFile *f)
                 qemu_file_set_error(f, ret);
             }
             break;
+        case RAM_SAVE_FLAG_METADATA:
+            // 1. サイズを受信 (戻り値で受け取る)
+            size_t metadata_size = qemu_get_be64(f);
+            
+            // 2. QEMU標準の g_malloc でメモリを確保
+            uint8_t *metadata = g_malloc(metadata_size);
+            if (!metadata) {
+                error_report("Failed to allocate memory for MongoDB metadata");
+                ret = -ENOMEM;
+                break;
+            }
+
+            // 3. データ本体を受信
+            qemu_get_buffer(f, metadata, metadata_size);
+            fprintf(stderr, "[MIG-INFO] Received MongoDB Metadata: %zu bytes\n", metadata_size);
+
+            // 4. ここでバックグラウンドスレッドを立ち上げ、
+            // metadata を渡して裏で pread を走らせる！
+            //launch_mongo_prefetch_thread(metadata, metadata_size);
+            break;
         case RAM_SAVE_FLAG_SKIPPED:
+            // 先頭 64 バイトを受信
             qemu_get_buffer(f, host, WT_HDR_SKIP_SIZE);
             memset(host + WT_HDR_SKIP_SIZE, 0x00, TARGET_PAGE_SIZE - WT_HDR_SKIP_SIZE);
             break;

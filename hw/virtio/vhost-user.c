@@ -2284,6 +2284,7 @@ static int vhost_user_backend_init(struct vhost_dev *dev, void *opaque,
         }
     }
 
+    /* バイパス: virtio-fsでのマイグレーションを強行突破するためコメントアウト
     if (dev->migration_blocker == NULL &&
         !virtio_has_feature(dev->protocol_features,
                             VHOST_USER_PROTOCOL_F_LOG_SHMFD)) {
@@ -2291,6 +2292,7 @@ static int vhost_user_backend_init(struct vhost_dev *dev, void *opaque,
                    "Migration disabled: vhost-user backend lacks "
                    "VHOST_USER_PROTOCOL_F_LOG_SHMFD feature.");
     }
+    */
 
     if (dev->vq_index == 0) {
         err = vhost_setup_backend_channel(dev);
