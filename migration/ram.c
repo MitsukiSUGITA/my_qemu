@@ -100,8 +100,9 @@ typedef struct {
 /* --- 5. スキップページ復元機構 --- */
 /* 1. ディスク上のブロックメタデータ（最下層） */
 typedef struct __attribute__((packed)) {
-    uint64_t offset;   // ファイル内の物理オフセット (QEMUがpreadで先読みするため)
-    uint32_t size;     // ディスク上の圧縮ブロックサイズ
+    uint64_t lba;       // ファイル内オフセットではなく、仮想ディスク上のLBA(セクタ番号)
+    uint32_t size;      // ディスク上の圧縮ブロックサイズ
+    uint64_t gpfn;      // ゲスト物理ページフレーム番号 (復元先メモリアドレス)
 } BlockMeta;
 
 /* 2. ファイルごとのメタデータグループ（中間層） */
@@ -3394,7 +3395,15 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
     int ret, max_hg_page_size;
 
     mig_cpu_start = get_mig_thread_cpu_time(); // 移送開始時点のQEMU移送スレッドの純粋なCPU時間を記録
-#if ENABLE_MONGO_SYNC_EXPERIMENT
+
+    /* migration has already setup the bitmap, reuse it. */
+    if (!migration_in_colo_state()) {
+        if (ram_init_all(rsp, errp) != 0) {
+            return -1;
+        }
+    }
+
+    #if ENABLE_MONGO_SYNC_EXPERIMENT
     RAMState *rs = *rsp; // QEMU標準の移送状態構造体
     rs->mongo_meta = NULL;
     rs->mongo_meta_size = 0;
@@ -3413,11 +3422,10 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
         // 4. 転送量を統計情報に追加する処理（8 + 8 + データサイズ）
         ram_transferred_add(16 + rs->mongo_meta_size);
         // 5. 送信が終わったら安全に解放し，ポインタをリセット（リーク防止）
+        fprintf(stderr, "[MIG-INFO] Sent MongoDB Metadata (%lu bytes).\n", rs->mongo_meta_size);
         free(rs->mongo_meta);
         rs->mongo_meta = NULL;
         rs->mongo_meta_size = 0;
-
-        fprintf(stderr, "[MIG-INFO] Sent MongoDB Metadata (%lu bytes).\n", rs->mongo_meta_size);
 
         sleep(10);
     }
@@ -3425,12 +3433,6 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
     printf("[MIG-INFO] Running normal precopy.\n");
 #endif
 
-    /* migration has already setup the bitmap, reuse it. */
-    if (!migration_in_colo_state()) {
-        if (ram_init_all(rsp, errp) != 0) {
-            return -1;
-        }
-    }
     (*rsp)->pss[RAM_CHANNEL_PRECOPY].pss_channel = f;
 
     /*

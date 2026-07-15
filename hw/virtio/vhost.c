@@ -1633,7 +1633,6 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
         .region_del = vhost_iommu_region_del,
     };
 
-    /* バイパス: 強制突破のためチェックを無効化
     if (hdev->migration_blocker == NULL) {
         if (!virtio_has_feature_ex(hdev->features_ex, VHOST_F_LOG_ALL)) {
             error_setg(&hdev->migration_blocker,
@@ -1643,7 +1642,6 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
                        "Migration disabled: failed to allocate shared memory");
         }
     }
-    */
 
     if (hdev->migration_blocker != NULL) {
         r = migrate_add_blocker_normal(&hdev->migration_blocker, errp);
