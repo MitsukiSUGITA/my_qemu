@@ -98,28 +98,123 @@ typedef struct {
 
 // スキップページ復元機構
 /* --- 5. スキップページ復元機構 --- */
-/* 1. ディスク上のブロックメタデータ（最下層） */
+/* --- スキップページ LBAマッピングテーブル構造体 --- */
 typedef struct __attribute__((packed)) {
-    uint64_t lba;       // ファイル内オフセットではなく、仮想ディスク上のLBA(セクタ番号)
-    uint32_t size;      // ディスク上の圧縮ブロックサイズ
-    uint64_t gpfn;      // ゲスト物理ページフレーム番号 (復元先メモリアドレス)
-} BlockMeta;
+    uint64_t gpfn; // ゲストRAMブロック内でのオフセット
+    uint64_t lba;        // qcow2(または/dev/vdb)上の物理セクタ番号
+    uint32_t size;       // 連続するサイズ (例: 48KB = 49152)
+} LbaMapEntry;
 
-/* 2. ファイルごとのメタデータグループ（中間層） */
 typedef struct {
-    char f_name[128];       // 復元する対象のファイル名
-    uint32_t block_num;     // このファイルから復元するブロック数
-    uint32_t block_capacity;// 動的拡張のためのキャパシティ
-    BlockMeta *blocks;      // 復元するブロックのメタデータ配列へのポインタ
-} FileGroupMeta;
+    uint32_t entry_num;  // エントリ数
+    LbaMapEntry *entries;// マッピング配列の先頭ポインタ
+} LbaMapTable;
 
-/* 3. 全体を管理するルート構造体（最上位） */
-typedef struct {
-    uint32_t file_num;      // 対象となるファイルの総数
-    uint32_t file_capacity; // 動的拡張のためのキャパシティ
-    FileGroupMeta *files;   // 各ファイルグループの配列へのポインタ
-} GlobalRestoreMeta;
+static LbaMapTable g_lba_map_table = {0, NULL};
 
+/* [デバッグ検証①] デシリアライズ結果のサンプリングダンプ */
+static void dump_received_lba_table(void)
+{
+    if (!g_lba_map_table.entries || g_lba_map_table.entry_num == 0) return;
+
+    fprintf(stderr, "\n=== [DEST VERIFY ①] LBA Index Table Dump ===\n");
+    fprintf(stderr, "Total Entries: %u\n", g_lba_map_table.entry_num);
+    
+    // 先頭最大3件を出力
+    uint32_t show_head = MIN(g_lba_map_table.entry_num, 3);
+    for (uint32_t i = 0; i < show_head; i++) {
+        fprintf(stderr, "  [%u] GPFN: %lu (0x%lx), LBA: %lu, Size: %u\n",
+                i, g_lba_map_table.entries[i].gpfn, g_lba_map_table.entries[i].gpfn,
+                g_lba_map_table.entries[i].lba, g_lba_map_table.entries[i].size);
+    }
+    // 末尾1件を出力
+    if (g_lba_map_table.entry_num > 3) {
+        uint32_t last = g_lba_map_table.entry_num - 1;
+        fprintf(stderr, "  ... (omitted) ...\n");
+        fprintf(stderr, "  [%u] GPFN: %lu (0x%lx), LBA: %lu, Size: %u\n",
+                last, g_lba_map_table.entries[last].gpfn, g_lba_map_table.entries[last].gpfn,
+                g_lba_map_table.entries[last].lba, g_lba_map_table.entries[last].size);
+    }
+    fprintf(stderr, "============================================\n\n");
+}
+
+/* [デバッグ検証②] RAMオフセットから対象のLBAを探索する関数 */
+static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
+{
+    if (!g_lba_map_table.entries || g_lba_map_table.entry_num == 0) return 0;
+    if (strcmp(block->idstr, "pc.ram") != 0) return 0;
+
+    // 1. RAMオフセットからPCIホール(3GB~4GB)を考慮してゲスト物理アドレス(GPA)とGPFNを逆算
+    uint64_t gpa = offset + (offset >= 0xC0000000 ? 0x40000000 : 0);
+    uint64_t target_gpfn = gpa >> TARGET_PAGE_BITS;
+
+    // 2. インデックステーブルを線形探索 (※本番環境では二分探索・ハッシュ化しますが検証中はこれで十分です)
+    for (uint32_t i = 0; i < g_lba_map_table.entry_num; i++) {
+        uint64_t start_gpfn = g_lba_map_table.entries[i].gpfn;
+        uint32_t pages_in_block = g_lba_map_table.entries[i].size / TARGET_PAGE_SIZE;
+        
+        // 対象のGPFNがこのLBAブロックの範囲内に含まれているか
+        if (target_gpfn >= start_gpfn && target_gpfn < (start_gpfn + pages_in_block)) {
+            // ブロック先頭からのページ差分をセクタ数(1ページ=8セクタ)に換算して加算
+            uint64_t page_diff = target_gpfn - start_gpfn;
+            return g_lba_map_table.entries[i].lba + (page_diff * 8);
+        }
+    }
+    return 0; // 見つからなかった場合
+}
+
+/* [デバッグ検証③] ディスク先読み＆ネットワーク受信データの完全一致照合エンジン */
+static void verify_received_page_with_lba(RAMBlock *block, ram_addr_t offset, void *net_data)
+{
+    uint64_t lba = lookup_lba_by_ram_offset(block, offset);
+    if (lba == 0) {
+        // スキップ対象外（ダーティ等）で偶然フラグが立った場合は無視
+        return;
+    }
+
+    // ★注意: 移送先QEMUがアクセスできるストレージデバイスパスを指定してください
+    // (例: プランAなら "/dev/vdb", 現状のLVM共有なら同じマッパーパス)
+    const char *disk_path = "/dev/mapper/ubuntu--vg-ubuntu--lv"; 
+    int fd = open(disk_path, O_RDONLY | O_DIRECT);
+    
+    if (fd < 0) {
+        fprintf(stderr, "[VERIFY-ERR] Cannot open disk %s (errno: %d)\n", disk_path, errno);
+        return;
+    }
+
+    void *disk_buf;
+    if (posix_memalign(&disk_buf, TARGET_PAGE_SIZE, TARGET_PAGE_SIZE) == 0) {
+        
+        // LBA(セクタ) * 512 で物理バイトオフセットを指定して直接読み出し
+        if (pread(fd, disk_buf, TARGET_PAGE_SIZE, lba * 512) == TARGET_PAGE_SIZE) {
+            
+            // ネットワークから届いた本物のデータ(net_data)とディスクデータ(disk_buf)を照合
+            if (memcmp(net_data, disk_buf, TARGET_PAGE_SIZE) == 0) {
+                fprintf(stderr, "[DEST VERIFY OK!] Offset: 0x%lx -> LBA: %lu (100%% Match)\n", 
+                        (unsigned long)offset, lba);
+            } else {
+                fprintf(stderr, "[DEST VERIFY MISMATCH!] Offset: 0x%lx -> LBA: %lu\n", 
+                        (unsigned long)offset, lba);
+                
+                // 最初の数回だけ、どこが違うのかHexダンプを出力して分析を助ける
+                static int err_dump_cnt = 0;
+                if (err_dump_cnt < 3) {
+                    fprintf(stderr, "--- Destination Mismatch Hex Dump (First 32 bytes) ---\n");
+                    fprintf(stderr, "NET(True): ");
+                    for(int i = 0; i < 32; i++) fprintf(stderr, "%02x ", ((unsigned char*)net_data)[i]);
+                    fprintf(stderr, "\nDSK(Read): ");
+                    for(int i = 0; i < 32; i++) fprintf(stderr, "%02x ", ((unsigned char*)disk_buf)[i]);
+                    fprintf(stderr, "\n-----------------------------------------------------\n");
+                    err_dump_cnt++;
+                }
+            }
+        } else {
+            fprintf(stderr, "[VERIFY-ERR] pread failed for LBA: %lu (errno: %d)\n", lba, errno);
+        }
+        free(disk_buf);
+    }
+    close(fd);
+}
 
 #if defined(__linux__)
 #include "qemu/userfaultfd.h"
@@ -2346,8 +2441,14 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
                 uint8_t *p = pss->block->host + offset_in_block;
                 pages++;
                 
-                ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset_in_block | RAM_SAVE_FLAG_SKIPPED));
-                qemu_put_buffer(pss->pss_channel, p, WT_HDR_SKIP_SIZE);
+                if (ENABLE_LBA_VERIFY_MODE) {
+                    ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset_in_block | RAM_SAVE_FLAG_VERIFY_LBA));
+                    qemu_put_buffer(pss->pss_channel, p, TARGET_PAGE_SIZE); 
+                } else {
+                    // 本番モード: スキップフラグを立てて「ヘッダ(64B)」だけ送る
+                    ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset_in_block | RAM_SAVE_FLAG_SKIPPED));
+                    qemu_put_buffer(pss->pss_channel, p, WT_HDR_SKIP_SIZE);
+                }
                 actual_skipped_pages++;
             } else 
 #endif /* ENABLE_MONGO_SYNC_EXPERIMENT */
@@ -3234,32 +3335,29 @@ static void ensure_mongo_sync_initialized(void)
     }
 }
 
-/*
 // MongoDBからのメタデータについて指定されたサイズを確実に全量読み取る関数
-static uint8_t* read_exact(int fd, const uint8_t *buf, size_t *size) {
-    size_t read_size = 0;
-    const uint8_t *ptr = buf;      // 現在の読み込み位置
+static int read_exact(int fd, uint8_t *buf, size_t size) {
+    size_t remaining = size;
+    uint8_t *ptr = buf;      // 現在の読み込み位置
 
     while (remaining > 0) {
         // OSに書き込みを依頼
-        ssize_t read = read(fd, ptr, remaining);
+        ssize_t n = read(fd, ptr, remaining);
 
-        if (read < 0) {
+        if (n < 0) {
             // エラー処理
             if (errno == EINTR) continue; // シグナル割り込みの場合は、もう一度やり直す
             return -1; // 本当の致命的エラーの場合
         }
-        if (read == 0) return -1; // EOF (予期せぬ切断)
+        if (n == 0) return -1; // EOF (予期せぬ切断)
 
         // 書き込めた分だけ，ポインタと残りサイズを更新
-        ptr += read;
-        read_size += read;
+        ptr += n;
+        remaining -= n;
     }
 
-    *size = read_size;
     return 0; // 全量書き込み完了！
 }
-*/
 
 /* MongoDBへメモリ収集・退避・再開コマンドを発行し、必要に応じてBQLを管理して完了を待つ */
 void wait_for_mongo_migration_action(int flag)
@@ -3270,8 +3368,8 @@ void wait_for_mongo_migration_action(int flag)
     if (!rs) return; // 初期化されていない場合の安全策
 
     int sock_fd = -1;
-    //uint8_t *metadata = NULL;
-    //uint64_t metadata_size = 0;
+    uint8_t *metadata = NULL;
+    uint64_t metadata_size = 0;
 
     // フェーズ１なら，ゲストを動かす前にソケットに接続して待機
     if (flag == 1) {
@@ -3308,7 +3406,6 @@ void wait_for_mongo_migration_action(int flag)
 
     // 処理完了のロギングと後始末
     if (flag == 1 && mongo_done_flag == 1) {
-        /*
         // 収集完了後，ソケットからデータを吸い出す
         if (sock_fd >= 0) {
             // 1. 最初にゲストから送られてくるサイズ(8バイト)を読む
@@ -3330,7 +3427,6 @@ void wait_for_mongo_migration_action(int flag)
             }
             close(sock_fd);
         }
-            */
 
         // mongo_shared_bitmap (uint8_t配列) から実際にセットされたビットを数える
         size_t skip_count = 0;
@@ -4824,7 +4920,7 @@ static int ram_load_precopy(QEMUFile *f)
         }
 
         if (flags & (RAM_SAVE_FLAG_ZERO | RAM_SAVE_FLAG_PAGE |
-                     RAM_SAVE_FLAG_XBZRLE | RAM_SAVE_FLAG_SKIPPED)) {
+                     RAM_SAVE_FLAG_XBZRLE | RAM_SAVE_FLAG_SKIPPED | RAM_SAVE_FLAG_VERIFY_LBA)) {
             RAMBlock *block = ram_block_from_stream(mis, f, flags,
                                                     RAM_CHANNEL_PRECOPY);
 
@@ -4938,9 +5034,40 @@ static int ram_load_precopy(QEMUFile *f)
             qemu_get_buffer(f, metadata, metadata_size);
             fprintf(stderr, "[MIG-INFO] Received MongoDB Metadata: %zu bytes\n", metadata_size);
 
+            // 古いテーブルがあれば解放し、新しいマッピングを構築
+            if (g_lba_map_table.entries) {
+                g_free(g_lba_map_table.entries);
+            }
+
+            // バイト列の先頭からエントリ数を読み取る
+            memcpy(&g_lba_map_table.entry_num, metadata, sizeof(uint32_t));
+            size_t entries_size = g_lba_map_table.entry_num * sizeof(LbaMapEntry);
+            
+            g_lba_map_table.entries = g_malloc(entries_size);
+            memcpy(g_lba_map_table.entries, metadata + sizeof(uint32_t), entries_size);
+            
+            fprintf(stderr, "[MIG-INFO] Index Table Built! Total LBA Entries: %u\n", 
+                    g_lba_map_table.entry_num);
+
+            // ★追加: デシリアライズの数値が正しいかダンプして証明する
+            dump_received_lba_table();
+
+            g_free(metadata);
+
             // 4. ここでバックグラウンドスレッドを立ち上げ、
             // metadata を渡して裏で pread を走らせる！
             //launch_mongo_prefetch_thread(metadata, metadata_size);
+            break;
+        // ハイブリッド送信比較検証モード
+        case RAM_SAVE_FLAG_VERIFY_LBA:
+
+            RAMBlock *block = ram_block_from_stream(mis, f, flags, RAM_CHANNEL_PRECOPY);
+            if (!block) { ret = -EINVAL; break; }
+
+            // 1. ネットワークから通常の正解データ(4096バイト)をメモリに受信
+            qemu_get_buffer(f, host, TARGET_PAGE_SIZE);
+            // 2. ★追加: 受け取ったばかりの本物のデータと、ディスクのLBA先読みデータを比較！
+            verify_received_page_with_lba(block, addr, host);
             break;
         case RAM_SAVE_FLAG_SKIPPED:
             // 先頭 64 バイトを受信
