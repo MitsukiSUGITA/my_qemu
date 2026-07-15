@@ -63,6 +63,9 @@
 #include "options.h"
 #include "system/dirtylimit.h"
 #include "system/kvm.h"
+#include "system/block-backend-global-state.h"
+#include "system/block-backend-io.h"
+#include "qemu/memalign.h"
 
 #include "hw/boards.h" /* for machine_dump_guest_core() */
 
@@ -163,57 +166,60 @@ static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
     return 0; // 見つからなかった場合
 }
 
-/* [デバッグ検証③] ディスク先読み＆ネットワーク受信データの完全一致照合エンジン */
+/* [本番仕様対応版] QEMUブロックAPIを使用したディスク先読み＆比較検証関数 */
 static void verify_received_page_with_lba(RAMBlock *block, ram_addr_t offset, void *net_data)
 {
     uint64_t lba = lookup_lba_by_ram_offset(block, offset);
-    if (lba == 0) {
-        // スキップ対象外（ダーティ等）で偶然フラグが立った場合は無視
-        return;
-    }
+    if (lba == 0) return;
 
-    // ★注意: 移送先QEMUがアクセスできるストレージデバイスパスを指定してください
-    // (例: プランAなら "/dev/vdb", 現状のLVM共有なら同じマッパーパス)
-    const char *disk_path = "/dev/mapper/ubuntu--vg-ubuntu--lv"; 
-    int fd = open(disk_path, O_RDONLY | O_DIRECT);
-    
-    if (fd < 0) {
-        fprintf(stderr, "[VERIFY-ERR] Cannot open disk %s (errno: %d)\n", disk_path, errno);
-        return;
-    }
-
-    void *disk_buf;
-    if (posix_memalign(&disk_buf, TARGET_PAGE_SIZE, TARGET_PAGE_SIZE) == 0) {
-        
-        // LBA(セクタ) * 512 で物理バイトオフセットを指定して直接読み出し
-        if (pread(fd, disk_buf, TARGET_PAGE_SIZE, lba * 512) == TARGET_PAGE_SIZE) {
-            
-            // ネットワークから届いた本物のデータ(net_data)とディスクデータ(disk_buf)を照合
-            if (memcmp(net_data, disk_buf, TARGET_PAGE_SIZE) == 0) {
-                fprintf(stderr, "[DEST VERIFY OK!] Offset: 0x%lx -> LBA: %lu (100%% Match)\n", 
-                        (unsigned long)offset, lba);
-            } else {
-                fprintf(stderr, "[DEST VERIFY MISMATCH!] Offset: 0x%lx -> LBA: %lu\n", 
-                        (unsigned long)offset, lba);
-                
-                // 最初の数回だけ、どこが違うのかHexダンプを出力して分析を助ける
-                static int err_dump_cnt = 0;
-                if (err_dump_cnt < 3) {
-                    fprintf(stderr, "--- Destination Mismatch Hex Dump (First 32 bytes) ---\n");
-                    fprintf(stderr, "NET(True): ");
-                    for(int i = 0; i < 32; i++) fprintf(stderr, "%02x ", ((unsigned char*)net_data)[i]);
-                    fprintf(stderr, "\nDSK(Read): ");
-                    for(int i = 0; i < 32; i++) fprintf(stderr, "%02x ", ((unsigned char*)disk_buf)[i]);
-                    fprintf(stderr, "\n-----------------------------------------------------\n");
-                    err_dump_cnt++;
-                }
-            }
-        } else {
-            fprintf(stderr, "[VERIFY-ERR] pread failed for LBA: %lu (errno: %d)\n", lba, errno);
+    // 1. 先ほどスクリプトに追加した ID で仮想ブロックデバイス（BlockBackend）を取得！
+    BlockBackend *blk = blk_by_name("mongo-disk");
+    if (!blk) {
+        // 万が一名前で見つからない場合は、システムで最初に登録されているディスクを自動フォールバック取得
+        blk = blk_next(NULL); 
+        if (!blk) {
+            fprintf(stderr, "[VERIFY-ERR] No BlockBackend found in QEMU!\n");
+            return;
         }
-        free(disk_buf);
     }
-    close(fd);
+
+    // 2. 読み出し用のバッファを QEMU ディスクアライメントに合わせて確保
+    void *disk_buf = qemu_blockalign(blk_bs(blk), TARGET_PAGE_SIZE);
+    if (!disk_buf) {
+        fprintf(stderr, "[VERIFY-ERR] Failed to allocate memory for block read\n");
+        return;
+    }
+
+    // 3. QEMU内部API (blk_pread) で LBA(セクタ) * 512 バイト目の位置から読み出し
+    // ※ qcow2 の L1/L2 テーブルの計算・翻訳は、QEMUが全て自動でやってくれます！
+    int ret = blk_pread(blk, lba * 512, TARGET_PAGE_SIZE, disk_buf, 0);
+    
+    if (ret < 0) {
+        fprintf(stderr, "[VERIFY-ERR] blk_pread failed for LBA: %lu (error: %d)\n", lba, ret);
+    } else {
+        // 4. ネットワークからの正解データ(net_data)と、qcow2から読んだデータ(disk_buf)を照合！
+        if (memcmp(net_data, disk_buf, TARGET_PAGE_SIZE) == 0) {
+            fprintf(stderr, "[DEST VERIFY OK!] Offset: 0x%lx -> LBA: %lu (100%% MATCH!)\n", 
+                    (unsigned long)offset, lba);
+        } else {
+            fprintf(stderr, "[DEST VERIFY MISMATCH!] Offset: 0x%lx -> LBA: %lu\n", 
+                    (unsigned long)offset, lba);
+            
+            static int err_dump_cnt = 0;
+            if (err_dump_cnt < 3) {
+                fprintf(stderr, "--- QEMU Block Layer Mismatch Hex Dump (First 32 bytes) ---\n");
+                fprintf(stderr, "NET(True): ");
+                for(int i = 0; i < 32; i++) fprintf(stderr, "%02x ", ((unsigned char*)net_data)[i]);
+                fprintf(stderr, "\nBLK(Read): ");
+                for(int i = 0; i < 32; i++) fprintf(stderr, "%02x ", ((unsigned char*)disk_buf)[i]);
+                fprintf(stderr, "\n--------------------------------------------------------------\n");
+                err_dump_cnt++;
+            }
+        }
+    }
+
+    // 5. バッファの解放 (qemu_blockalign で確保したものは qemu_vfree で解放する)
+    qemu_vfree(disk_buf);
 }
 
 #if defined(__linux__)
@@ -2392,6 +2398,7 @@ bool consume_skipbitmap_token(RAMBlock *block, uint64_t ram_offset)
     return (__sync_fetch_and_and(&mongo_shared_bitmap[gpfn / 8], ~mask) & mask) != 0;
 }
 
+static int verify_counter = 0;
 /**
  * ram_save_host_page: save a whole host page
  *
@@ -2416,7 +2423,7 @@ bool consume_skipbitmap_token(RAMBlock *block, uint64_t ram_offset)
 static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
 {
     bool page_dirty, preempt_active = postcopy_preempt_active();
-    int tmppages, pages = 0;
+    int tmppages = 0, pages = 0;
     size_t pagesize_bits = qemu_ram_pagesize(pss->block) >> TARGET_PAGE_BITS;
     unsigned long start_page = pss->page;
     int res;
@@ -2441,7 +2448,7 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
                 uint8_t *p = pss->block->host + offset_in_block;
                 pages++;
                 
-                if (ENABLE_LBA_VERIFY_MODE) {
+                if (ENABLE_LBA_VERIFY_MODE && verify_counter++ < 10) {
                     ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset_in_block | RAM_SAVE_FLAG_VERIFY_LBA));
                     qemu_put_buffer(pss->pss_channel, p, TARGET_PAGE_SIZE); 
                 } else {
@@ -3400,34 +3407,47 @@ void wait_for_mongo_migration_action(int flag)
     bool locked = bql_locked(); // 現在のスレッドがBQLを保持しているか確認
     if (locked) bql_unlock(); // BQLを持っている場合のみ，ゲストを動かすためにアンロックする
     
-    qemu_sem_wait(&mongo_clear_sem); // ゲスト(MongoDB側)からの処理完了セマフォを待機
 
-    if (locked) bql_lock(); // 待機完了後、BQLを元の状態に復元
+
+    // 処理完了のロギングと後始末
+    if (flag == 1 && sock_fd >= 0) {
+        fprintf(stderr, "[CHK 1-A] Reading metadata size (8 bytes) from socket...\n");
+        
+        // ゲストがデータを書き込み始めると、ここでリアルタイムに読み出される
+        // 1. 最初にゲストから送られてくるサイズ(8バイト)を読む
+        if (read_exact(sock_fd, (uint8_t*)&metadata_size, sizeof(uint64_t)) == 0) {
+            fprintf(stderr, "[CHK 1-B] Size read success (%lu bytes). Reading body...\n", metadata_size);
+            
+            // 2. 受け取ったサイズ分だけメモリを確保
+            metadata = malloc(metadata_size);
+            // 3. 本体を全量読む
+            if (metadata && read_exact(sock_fd, metadata, metadata_size) == 0) {
+                fprintf(stderr, "[CHK 1-C] Body read success!\n");
+                if (rs != NULL) {
+                    rs->mongo_meta = metadata;
+                    rs->mongo_meta_size = metadata_size;
+                } else {
+                    free(metadata);
+                }
+            } else {
+                fprintf(stderr, "[CHK-ERR] Failed while reading body!\n");
+            }
+        } else {
+            fprintf(stderr, "[CHK-ERR] Failed to read size from socket!\n");
+        }
+        close(sock_fd);
+        sock_fd = -1; // 読み込み完了
+    }
+
+    fprintf(stderr, "[CHK 2] Waiting for mongo_clear_sem (outl(1) ACK)...\n");
+    // ソケットを読み終えた（＝ゲストも書き終えて outl(1) を発信した）ため、ここは一瞬で通過する！
+    qemu_sem_wait(&mongo_clear_sem); 
+    fprintf(stderr, "[CHK 3] Sem acquired! Relocking BQL...\n");
+
+    if (locked) bql_lock();
 
     // 処理完了のロギングと後始末
     if (flag == 1 && mongo_done_flag == 1) {
-        // 収集完了後，ソケットからデータを吸い出す
-        if (sock_fd >= 0) {
-            // 1. 最初にゲストから送られてくるサイズ(8バイト)を読む
-            if (read_exact(sock_fd, (uint8_t*)&metadata_size, sizeof(uint64_t)) == 0) {
-                // 2. 受け取ったサイズ分だけメモリを確保
-                metadata = malloc(metadata_size);
-                if (metadata) {
-                    // 3. 本体を全量読む
-                    if (read_exact(sock_fd, metadata, metadata_size) == 0) {
-                        // RAMState に直接保存
-                        if (rs != NULL) {
-                            rs->mongo_meta = metadata;
-                            rs->mongo_meta_size = metadata_size;
-                        } else {
-                            free(metadata); // 受け皿がなければ捨てる
-                        }
-                    }
-                }
-            }
-            close(sock_fd);
-        }
-
         // mongo_shared_bitmap (uint8_t配列) から実際にセットされたビットを数える
         size_t skip_count = 0;
         if (mongo_shared_bitmap) {
@@ -3523,7 +3543,7 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
         rs->mongo_meta = NULL;
         rs->mongo_meta_size = 0;
 
-        sleep(10);
+        // sleep(10);
     }
 #else
     printf("[MIG-INFO] Running normal precopy.\n");

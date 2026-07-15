@@ -13,7 +13,8 @@ QEMU_ALLOW_IVSHMEM_MIGRATION=1 \
      -cpu host \
      -smp 2 \
      -L /usr/share/qemu \
-     -drive file=/var/lib/libvirt/images/migration.qcow2,format=qcow2,if=virtio,cache=none,file.locking=off \
+     -drive file=/var/lib/libvirt/images/migration.qcow2,format=qcow2,if=virtio,cache=none,file.locking=off,id=drive-virtio-disk0 \
+     -drive file=/var/lib/libvirt/images/mongo_data.qcow2,format=qcow2,if=virtio,cache=none,file.locking=off,id=mongo-disk \
      -netdev bridge,id=net0,br=br0 \
      -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56 \
      -device virtio-serial-pci \
