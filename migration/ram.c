@@ -167,6 +167,7 @@ static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
 }
 
 /* [本番仕様対応版] QEMUブロックAPIを使用したディスク先読み＆比較検証関数 */
+int match = 0, mismatch = 0;
 static void verify_received_page_with_lba(RAMBlock *block, ram_addr_t offset, void *net_data)
 {
     uint64_t lba = lookup_lba_by_ram_offset(block, offset);
@@ -201,17 +202,19 @@ static void verify_received_page_with_lba(RAMBlock *block, ram_addr_t offset, vo
         if (memcmp(net_data, disk_buf, TARGET_PAGE_SIZE) == 0) {
             fprintf(stderr, "[DEST VERIFY OK!] Offset: 0x%lx -> LBA: %lu (100%% MATCH!)\n", 
                     (unsigned long)offset, lba);
+            match++;
         } else {
             fprintf(stderr, "[DEST VERIFY MISMATCH!] Offset: 0x%lx -> LBA: %lu\n", 
                     (unsigned long)offset, lba);
+            mismatch++;
             
             static int err_dump_cnt = 0;
             if (err_dump_cnt < 3) {
                 fprintf(stderr, "--- QEMU Block Layer Mismatch Hex Dump (First 32 bytes) ---\n");
-                fprintf(stderr, "NET(True): ");
-                for(int i = 0; i < 32; i++) fprintf(stderr, "%02x ", ((unsigned char*)net_data)[i]);
-                fprintf(stderr, "\nBLK(Read): ");
-                for(int i = 0; i < 32; i++) fprintf(stderr, "%02x ", ((unsigned char*)disk_buf)[i]);
+                fprintf(stderr, "NET(True)\n");
+                for(int i = 0; i < 4096; i++) fprintf(stderr, "%02x ", ((unsigned char*)net_data)[i]);
+                fprintf(stderr, "\nBLK(Read)\n");
+                for(int i = 0; i < 4096; i++) fprintf(stderr, "%02x ", ((unsigned char*)disk_buf)[i]);
                 fprintf(stderr, "\n--------------------------------------------------------------\n");
                 err_dump_cnt++;
             }
@@ -3399,6 +3402,10 @@ void wait_for_mongo_migration_action(int flag)
     if (flag == 3) {
         // 移送先での再開通知はQEMUをブロック(デッドロック)させないよう即座にリターン
         fprintf(stderr, "[MIG-INFO] Signal 3 (Resume) sent async.\n");
+        fprintf(stderr, " LBA match    : %d (%d%%)\n"
+                        " LBA mismatch : %d (%d%%)\n"
+                        , match, 100 * match / (match + mismatch),
+                        mismatch, 100 * mismatch / (match + mismatch));
         return;
     }
     fprintf(stderr, "[MIG-INFO] Signal %d sent. Waiting for guest...\n", flag);
