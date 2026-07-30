@@ -3374,7 +3374,20 @@ void wait_for_mongo_migration_action(int flag)
 {
     ensure_mongo_sync_initialized(); // 共有メモリ等の初期化状態を保証
 
-    RAMState *rs = ram_state; 
+    mongo_done_flag = 0;
+    mongo_command_flag = flag; // ゲストのポーリング用フラグ(1:収集, 2:退避, 3:再開)をセット
+
+    if (flag == 3) {
+        // 移送先での再開通知はQEMUをブロック(デッドロック)させないよう即座にリターン
+        fprintf(stderr, "[MIG-INFO] Signal 3 (Resume) sent async.\n");
+        fprintf(stderr, " LBA match    : %d (%d%%)\n"
+                        " LBA mismatch : %d (%d%%)\n"
+                        , match, 100 * match / (match + mismatch),
+                        mismatch, 100 * mismatch / (match + mismatch));
+        return;
+    }
+
+        RAMState *rs = ram_state; 
     if (!rs) return; // 初期化されていない場合の安全策
 
     int sock_fd = -1;
@@ -3395,19 +3408,7 @@ void wait_for_mongo_migration_action(int flag)
             sock_fd = -1;
         }
     }
-
-    mongo_done_flag = 0;
-    mongo_command_flag = flag; // ゲストのポーリング用フラグ(1:収集, 2:退避, 3:再開)をセット
-
-    if (flag == 3) {
-        // 移送先での再開通知はQEMUをブロック(デッドロック)させないよう即座にリターン
-        fprintf(stderr, "[MIG-INFO] Signal 3 (Resume) sent async.\n");
-        fprintf(stderr, " LBA match    : %d (%d%%)\n"
-                        " LBA mismatch : %d (%d%%)\n"
-                        , match, 100 * match / (match + mismatch),
-                        mismatch, 100 * mismatch / (match + mismatch));
-        return;
-    }
+    
     fprintf(stderr, "[MIG-INFO] Signal %d sent. Waiting for guest...\n", flag);
 
     // ゲストVMにCPU時間を割り当てて処理を進めさせるため，QEMU大域ロック(BQL)を一時解放
@@ -3430,12 +3431,8 @@ void wait_for_mongo_migration_action(int flag)
             // 3. 本体を全量読む
             if (metadata && read_exact(sock_fd, metadata, metadata_size) == 0) {
                 fprintf(stderr, "[CHK 1-C] Body read success!\n");
-                if (rs != NULL) {
-                    rs->mongo_meta = metadata;
-                    rs->mongo_meta_size = metadata_size;
-                } else {
-                    free(metadata);
-                }
+                rs->mongo_meta = metadata;
+                rs->mongo_meta_size = metadata_size;
             } else {
                 fprintf(stderr, "[CHK-ERR] Failed while reading body!\n");
             }
