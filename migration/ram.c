@@ -3387,7 +3387,7 @@ void wait_for_mongo_migration_action(int flag)
         return;
     }
 
-        RAMState *rs = ram_state; 
+    RAMState *rs = ram_state; 
     if (!rs) return; // 初期化されていない場合の安全策
 
     int sock_fd = -1;
@@ -5096,7 +5096,7 @@ static int ram_load_precopy(QEMUFile *f)
         case RAM_SAVE_FLAG_SKIPPED:
             // 先頭 64 バイトを受信
             qemu_get_buffer(f, host, WT_HDR_SKIP_SIZE);
-            memset(host + WT_HDR_SKIP_SIZE, 0x00, TARGET_PAGE_SIZE - WT_HDR_SKIP_SIZE);
+            //memset(host + WT_HDR_SKIP_SIZE, 0x00, TARGET_PAGE_SIZE - WT_HDR_SKIP_SIZE);
             break;
         default:
             error_report("Unknown combination of migration flags: 0x%x", flags);
