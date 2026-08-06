@@ -115,32 +115,7 @@ typedef struct {
 
 static LbaMapTable g_lba_map_table = {0, NULL};
 
-/* [デバッグ検証①] デシリアライズ結果のサンプリングダンプ */
-static void dump_received_lba_table(void)
-{
-    if (!g_lba_map_table.entries || g_lba_map_table.entry_num == 0) return;
-
-    fprintf(stderr, "\n=== [DEST VERIFY ①] LBA Index Table Dump ===\n");
-    fprintf(stderr, "Total Entries: %u\n", g_lba_map_table.entry_num);
-    
-    // 先頭最大3件を出力
-    uint32_t show_head = MIN(g_lba_map_table.entry_num, 3);
-    for (uint32_t i = 0; i < show_head; i++) {
-        fprintf(stderr, "  [%u] GPFN: %lu (0x%lx), LBA: %lu, Size: %u\n",
-                i, g_lba_map_table.entries[i].gpfn, g_lba_map_table.entries[i].gpfn,
-                g_lba_map_table.entries[i].lba, g_lba_map_table.entries[i].size);
-    }
-    // 末尾1件を出力
-    if (g_lba_map_table.entry_num > 3) {
-        uint32_t last = g_lba_map_table.entry_num - 1;
-        fprintf(stderr, "  ... (omitted) ...\n");
-        fprintf(stderr, "  [%u] GPFN: %lu (0x%lx), LBA: %lu, Size: %u\n",
-                last, g_lba_map_table.entries[last].gpfn, g_lba_map_table.entries[last].gpfn,
-                g_lba_map_table.entries[last].lba, g_lba_map_table.entries[last].size);
-    }
-    fprintf(stderr, "============================================\n\n");
-}
-
+#if 0
 /* [デバッグ検証②] RAMオフセットから対象のLBAを探索する関数 */
 static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
 {
@@ -159,89 +134,7 @@ static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
     }
     return 0; // 見つからなかった場合
 }
-
-/* [本番仕様対応版] QEMUブロックAPIを使用したディスク先読み＆比較検証関数 */
-int match = 0, mismatch = 0;
-static void verify_received_page_with_lba(RAMBlock *block, ram_addr_t offset, void *net_data)
-{
-    uint64_t lba = lookup_lba_by_ram_offset(block, offset);
-    if (lba == 0) return;
-
-    // 1. 先ほどスクリプトに追加した ID で仮想ブロックデバイス（BlockBackend）を取得！
-    BlockBackend *blk = blk_by_name("mongo-disk");
-    if (!blk) {
-        // 万が一名前で見つからない場合は、システムで最初に登録されているディスクを自動フォールバック取得
-        blk = blk_next(NULL); 
-        if (!blk) {
-            fprintf(stderr, "[VERIFY-ERR] No BlockBackend found in QEMU!\n");
-            return;
-        }
-    }
-
-    // 2. 読み出し用のバッファを QEMU ディスクアライメントに合わせて確保
-    void *disk_buf = qemu_blockalign(blk_bs(blk), TARGET_PAGE_SIZE);
-    if (!disk_buf) {
-        fprintf(stderr, "[VERIFY-ERR] Failed to allocate memory for block read\n");
-        return;
-    }
-
-    // 3. QEMU内部API (blk_pread) で LBA(セクタ) * 512 バイト目の位置から読み出し
-    // ※ qcow2 の L1/L2 テーブルの計算・翻訳は、QEMUが全て自動でやってくれます！
-    int ret = blk_pread(blk, lba * 512, TARGET_PAGE_SIZE, disk_buf, 0);
-    
-    if (ret < 0) {
-        fprintf(stderr, "[VERIFY-ERR] blk_pread failed for LBA: %lu (error: %d)\n", lba, ret);
-    } else {
-        // 4. ネットワークからの正解データ(net_data)と、qcow2から読んだデータ(disk_buf)を照合！
-        if (memcmp(net_data, disk_buf, TARGET_PAGE_SIZE) == 0) {
-            fprintf(stderr, "[DEST VERIFY OK!] Offset: 0x%lx -> LBA: %lu (100%% MATCH!)\n", 
-                    (unsigned long)offset, lba);
-            match++;
-        } else {
-            // offsetから target_gpfn を再計算してズレの要因を探る
-            uint64_t gpa = offset + (offset >= 0xC0000000 ? 0x40000000 : 0);
-            uint64_t target_gpfn = gpa >> 12; // TARGET_PAGE_BITS (4096 = 2^12)
-
-            fprintf(stderr, "[DEST VERIFY MISMATCH!] Offset: 0x%lx -> LBA: %lu (Target GPFN: %lu)\n", 
-                    (unsigned long)offset, lba, target_gpfn);
-            mismatch++;
-            
-            static int err_dump_cnt = 0;
-            if (err_dump_cnt < 3) {
-                fprintf(stderr, "--- QEMU Block Layer Mismatch Hex Dump (First 256 bytes) ---\n");
-                
-                fprintf(stderr, "[NET(True) - Received from Guest]\n");
-                for (int i = 0; i < 256; i += 16) {
-                    fprintf(stderr, "%04x: ", i);
-                    for (int j = 0; j < 16; j++) fprintf(stderr, "%02x ", ((unsigned char*)net_data)[i+j]);
-                    fprintf(stderr, " | ");
-                    for (int j = 0; j < 16; j++) {
-                        unsigned char c = ((unsigned char*)net_data)[i+j];
-                        fprintf(stderr, "%c", (c >= 32 && c <= 126) ? c : '.');
-                    }
-                    fprintf(stderr, "\n");
-                }
-                
-                fprintf(stderr, "\n[BLK(Read) - Read from QCOW2 LBA %lu]\n", lba);
-                for (int i = 0; i < 256; i += 16) {
-                    fprintf(stderr, "%04x: ", i);
-                    for (int j = 0; j < 16; j++) fprintf(stderr, "%02x ", ((unsigned char*)disk_buf)[i+j]);
-                    fprintf(stderr, " | ");
-                    for (int j = 0; j < 16; j++) {
-                        unsigned char c = ((unsigned char*)disk_buf)[i+j];
-                        fprintf(stderr, "%c", (c >= 32 && c <= 126) ? c : '.');
-                    }
-                    fprintf(stderr, "\n");
-                }
-                fprintf(stderr, "--------------------------------------------------------------\n");
-                err_dump_cnt++;
-            }
-        }
-    }
-
-    // 5. バッファの解放 (qemu_blockalign で確保したものは qemu_vfree で解放する)
-    qemu_vfree(disk_buf);
-}
+#endif
 
 #if defined(__linux__)
 #include "qemu/userfaultfd.h"
@@ -2419,7 +2312,6 @@ bool consume_skipbitmap_token(RAMBlock *block, uint64_t ram_offset)
     return (__sync_fetch_and_and(&mongo_shared_bitmap[gpfn / 8], ~mask) & mask) != 0;
 }
 
-static int verify_counter = 0;
 /**
  * ram_save_host_page: save a whole host page
  *
@@ -2468,15 +2360,8 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
             if (consume_skipbitmap_token(pss->block, offset_in_block)) {
                 uint8_t *p = pss->block->host + offset_in_block;
                 pages++;
-                
-                if (ENABLE_LBA_VERIFY_MODE && verify_counter != -1) {
-                    ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset_in_block | RAM_SAVE_FLAG_VERIFY_LBA));
-                    qemu_put_buffer(pss->pss_channel, p, TARGET_PAGE_SIZE); 
-                } else {
-                    // 本番モード: スキップフラグを立てて「ヘッダ(64B)」だけ送る
-                    ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset_in_block | RAM_SAVE_FLAG_SKIPPED));
-                    qemu_put_buffer(pss->pss_channel, p, WT_HDR_SKIP_SIZE);
-                }
+                ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset_in_block | RAM_SAVE_FLAG_SKIPPED));
+                qemu_put_buffer(pss->pss_channel, p, WT_HDR_SKIP_SIZE);
                 actual_skipped_pages++;
             } else 
 #endif /* ENABLE_MONGO_SYNC_EXPERIMENT */
@@ -3398,10 +3283,6 @@ void wait_for_mongo_migration_action(int flag)
     if (flag == 3) {
         // 移送先での再開通知はQEMUをブロック(デッドロック)させないよう即座にリターン
         fprintf(stderr, "[MIG-INFO] Signal 3 (Resume) sent async.\n");
-        fprintf(stderr, " LBA match    : %d (%d%%)\n"
-                        " LBA mismatch : %d (%d%%)\n"
-                        , match, 100 * match / (match + mismatch),
-                        mismatch, 100 * mismatch / (match + mismatch));
         return;
     }
 
@@ -4962,7 +4843,7 @@ static int ram_load_precopy(QEMUFile *f)
         }
 
         if (flags & (RAM_SAVE_FLAG_ZERO | RAM_SAVE_FLAG_PAGE |
-                     RAM_SAVE_FLAG_XBZRLE | RAM_SAVE_FLAG_SKIPPED | RAM_SAVE_FLAG_VERIFY_LBA)) {
+                     RAM_SAVE_FLAG_XBZRLE | RAM_SAVE_FLAG_SKIPPED)) {
             RAMBlock *block = ram_block_from_stream(mis, f, flags,
                                                     RAM_CHANNEL_PRECOPY);
 
@@ -5091,25 +4972,11 @@ static int ram_load_precopy(QEMUFile *f)
             fprintf(stderr, "[MIG-INFO] Index Table Built! Total LBA Entries: %u\n", 
                     g_lba_map_table.entry_num);
 
-            // ★追加: デシリアライズの数値が正しいかダンプして証明する
-            dump_received_lba_table();
-
             g_free(metadata);
 
             // 4. ここでバックグラウンドスレッドを立ち上げ、
             // metadata を渡して裏で pread を走らせる！
             //launch_mongo_prefetch_thread(metadata, metadata_size);
-            break;
-        // ハイブリッド送信比較検証モード
-        case RAM_SAVE_FLAG_VERIFY_LBA:
-
-            RAMBlock *block = ram_block_from_stream(mis, f, flags, RAM_CHANNEL_PRECOPY);
-            if (!block) { ret = -EINVAL; break; }
-
-            // 1. ネットワークから通常の正解データ(4096バイト)をメモリに受信
-            qemu_get_buffer(f, host, TARGET_PAGE_SIZE);
-            // 2. ★追加: 受け取ったばかりの本物のデータと、ディスクのLBA先読みデータを比較！
-            verify_received_page_with_lba(block, addr, host);
             break;
         case RAM_SAVE_FLAG_SKIPPED:
             // 先頭 64 バイトを受信

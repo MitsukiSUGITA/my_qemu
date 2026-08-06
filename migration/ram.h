@@ -62,7 +62,6 @@
 #define RAM_SAVE_FLAG_MULTIFD_FLUSH           0x200
 #define RAM_SAVE_FLAG_METADATA                0x100 // 移送開始時に転送するメタデータに関するフラグ
 #define RAM_SAVE_FLAG_SKIPPED                 0x400 // 転送をスキップするしたことを受信側に通知するフラグ
-#define RAM_SAVE_FLAG_VERIFY_LBA              0x800 // デバッグ検証モード用フラグ
 
 extern XBZRLECacheStats xbzrle_counters;
 
@@ -136,6 +135,4 @@ extern volatile int mongo_clear_status;
 // 実験用：MongoDBキャッシュクリア同期機能のON/OFFスイッチ
 // 1にすると同期処理を実行し、0にするとスキップ（対照実験用）
 #define ENABLE_MONGO_SYNC_EXPERIMENT 1
-// デバッグ用：LBAでフェッチした内容が一致しているか
-#define ENABLE_LBA_VERIFY_MODE 1
 #endif
