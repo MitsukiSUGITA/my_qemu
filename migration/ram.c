@@ -151,16 +151,10 @@ static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
     uint64_t gpa = offset + (offset >= 0xC0000000 ? 0x40000000 : 0);
     uint64_t target_gpfn = gpa >> TARGET_PAGE_BITS;
 
-    // 2. インデックステーブルを線形探索 (※本番環境では二分探索・ハッシュ化しますが検証中はこれで十分です)
+    // 完全一致検索 (1:1マッピング)
     for (uint32_t i = 0; i < g_lba_map_table.entry_num; i++) {
-        uint64_t start_gpfn = g_lba_map_table.entries[i].gpfn;
-        uint32_t pages_in_block = g_lba_map_table.entries[i].size / TARGET_PAGE_SIZE;
-        
-        // 対象のGPFNがこのLBAブロックの範囲内に含まれているか
-        if (target_gpfn >= start_gpfn && target_gpfn < (start_gpfn + pages_in_block)) {
-            // ブロック先頭からのページ差分をセクタ数(1ページ=8セクタ)に換算して加算
-            uint64_t page_diff = target_gpfn - start_gpfn;
-            return g_lba_map_table.entries[i].lba + (page_diff * 8);
+        if (g_lba_map_table.entries[i].gpfn == target_gpfn) {
+            return g_lba_map_table.entries[i].lba;
         }
     }
     return 0; // 見つからなかった場合
@@ -204,18 +198,42 @@ static void verify_received_page_with_lba(RAMBlock *block, ram_addr_t offset, vo
                     (unsigned long)offset, lba);
             match++;
         } else {
-            fprintf(stderr, "[DEST VERIFY MISMATCH!] Offset: 0x%lx -> LBA: %lu\n", 
-                    (unsigned long)offset, lba);
+            // offsetから target_gpfn を再計算してズレの要因を探る
+            uint64_t gpa = offset + (offset >= 0xC0000000 ? 0x40000000 : 0);
+            uint64_t target_gpfn = gpa >> 12; // TARGET_PAGE_BITS (4096 = 2^12)
+
+            fprintf(stderr, "[DEST VERIFY MISMATCH!] Offset: 0x%lx -> LBA: %lu (Target GPFN: %lu)\n", 
+                    (unsigned long)offset, lba, target_gpfn);
             mismatch++;
             
             static int err_dump_cnt = 0;
             if (err_dump_cnt < 3) {
-                fprintf(stderr, "--- QEMU Block Layer Mismatch Hex Dump (First 32 bytes) ---\n");
-                fprintf(stderr, "NET(True)\n");
-                for(int i = 0; i < 4096; i++) fprintf(stderr, "%02x ", ((unsigned char*)net_data)[i]);
-                fprintf(stderr, "\nBLK(Read)\n");
-                for(int i = 0; i < 4096; i++) fprintf(stderr, "%02x ", ((unsigned char*)disk_buf)[i]);
-                fprintf(stderr, "\n--------------------------------------------------------------\n");
+                fprintf(stderr, "--- QEMU Block Layer Mismatch Hex Dump (First 256 bytes) ---\n");
+                
+                fprintf(stderr, "[NET(True) - Received from Guest]\n");
+                for (int i = 0; i < 256; i += 16) {
+                    fprintf(stderr, "%04x: ", i);
+                    for (int j = 0; j < 16; j++) fprintf(stderr, "%02x ", ((unsigned char*)net_data)[i+j]);
+                    fprintf(stderr, " | ");
+                    for (int j = 0; j < 16; j++) {
+                        unsigned char c = ((unsigned char*)net_data)[i+j];
+                        fprintf(stderr, "%c", (c >= 32 && c <= 126) ? c : '.');
+                    }
+                    fprintf(stderr, "\n");
+                }
+                
+                fprintf(stderr, "\n[BLK(Read) - Read from QCOW2 LBA %lu]\n", lba);
+                for (int i = 0; i < 256; i += 16) {
+                    fprintf(stderr, "%04x: ", i);
+                    for (int j = 0; j < 16; j++) fprintf(stderr, "%02x ", ((unsigned char*)disk_buf)[i+j]);
+                    fprintf(stderr, " | ");
+                    for (int j = 0; j < 16; j++) {
+                        unsigned char c = ((unsigned char*)disk_buf)[i+j];
+                        fprintf(stderr, "%c", (c >= 32 && c <= 126) ? c : '.');
+                    }
+                    fprintf(stderr, "\n");
+                }
+                fprintf(stderr, "--------------------------------------------------------------\n");
                 err_dump_cnt++;
             }
         }
@@ -2451,7 +2469,7 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
                 uint8_t *p = pss->block->host + offset_in_block;
                 pages++;
                 
-                if (ENABLE_LBA_VERIFY_MODE && verify_counter++ < 10) {
+                if (ENABLE_LBA_VERIFY_MODE && verify_counter != -1) {
                     ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset_in_block | RAM_SAVE_FLAG_VERIFY_LBA));
                     qemu_put_buffer(pss->pss_channel, p, TARGET_PAGE_SIZE); 
                 } else {
