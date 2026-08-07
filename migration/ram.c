@@ -92,7 +92,7 @@ uint64_t actual_skipped_pages = 0;              /* 提案手法によって実�
 uint64_t total_canceled_pages = 0;              /* ゲストの再書き込み等によりスキップ判定を破棄(再送)したページ数 */
 double   mig_cpu_start        = 0.0;            /* QEMU移送スレッドのベースラインCPU時間 (開始時・秒) */
 double   mig_cpu_end          = 0.0;            /* QEMU移送スレッドの完了時CPU時間 (終了時・秒) */
-
+static uint64_t restored_pages_count = 0;
 /* --- 4. スレッドに渡すための引数パッケージ --- */
 typedef struct {
     uint8_t *metadata;
@@ -115,8 +115,7 @@ typedef struct {
 
 static LbaMapTable g_lba_map_table = {0, NULL};
 
-#if 0
-/* [デバッグ検証②] RAMオフセットから対象のLBAを探索する関数 */
+/* RAMオフセットから対象のLBAを探索する関数 */
 static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
 {
     if (!g_lba_map_table.entries || g_lba_map_table.entry_num == 0) return 0;
@@ -134,7 +133,6 @@ static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
     }
     return 0; // 見つからなかった場合
 }
-#endif
 
 #if defined(__linux__)
 #include "qemu/userfaultfd.h"
@@ -3724,6 +3722,7 @@ void output_migration_experiment_results(void)
             " Actually Skipped  : %lu pages\n"
             " True Dirty Cancel : %lu pages\n"
             " Skipped Size      : %.2f GB (%lu bytes)\n"
+            " Successfully restored %lu pages directly from disk.\n"
             " CSV log saved to  : %s\n"
             " =================================\n",
             time_buf, (int)(tv.tv_usec / 1000), 
@@ -3731,6 +3730,7 @@ void output_migration_experiment_results(void)
             actual_skipped_pages, 
             total_canceled_pages,
             skip_bytes / (1024.0 * 1024.0 * 1024.0), skip_bytes,
+            restored_pages_count,
             csv_path);
 }
 
@@ -4979,9 +4979,31 @@ static int ram_load_precopy(QEMUFile *f)
             //launch_mongo_prefetch_thread(metadata, metadata_size);
             break;
         case RAM_SAVE_FLAG_SKIPPED:
-            // 先頭 64 バイトを受信
-            qemu_get_buffer(f, host, WT_HDR_SKIP_SIZE);
-            //memset(host + WT_HDR_SKIP_SIZE, 0x00, TARGET_PAGE_SIZE - WT_HDR_SKIP_SIZE);
+            // 1. block と addr を使ってLBAを検索
+            uint64_t lba = lookup_lba_by_ram_offset(block, addr);
+            
+            if (lba > 0) {
+                BlockBackend *blk = blk_by_name("mongo-disk");
+                if (!blk) {
+                    blk = blk_next(NULL);
+                }
+
+                if (blk) {
+                    // 2. host へディスクから4096バイトを直接流し込む
+                    int pread_ret = blk_pread(blk, lba * 512, TARGET_PAGE_SIZE, host, 0);
+                    
+                    if (pread_ret < 0) {
+                        fprintf(stderr, "[RESTORE-FATAL] blk_pread failed for LBA: %lu\n", lba);
+                        ret = -EIO; 
+                    }
+                } else {
+                    fprintf(stderr, "[RESTORE-FATAL] BlockBackend not found!\n");
+                    ret = -EIO;
+                }
+            } else {
+                fprintf(stderr, "[RESTORE-FATAL] LBA not found for offset: 0x%lx\n", (unsigned long)addr);
+                ret = -EINVAL;
+            }            
             break;
         default:
             error_report("Unknown combination of migration flags: 0x%x", flags);
