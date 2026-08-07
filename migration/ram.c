@@ -2356,10 +2356,8 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
             uint64_t offset_in_block = ((ram_addr_t)pss->page) << TARGET_PAGE_BITS;
             // MongoDBの共有ビットマップに基づき，クリーンページならスキップヘッダのみ送信
             if (consume_skipbitmap_token(pss->block, offset_in_block)) {
-                uint8_t *p = pss->block->host + offset_in_block;
                 pages++;
                 ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset_in_block | RAM_SAVE_FLAG_SKIPPED));
-                qemu_put_buffer(pss->pss_channel, p, WT_HDR_SKIP_SIZE);
                 actual_skipped_pages++;
             } else 
 #endif /* ENABLE_MONGO_SYNC_EXPERIMENT */
@@ -3281,6 +3279,7 @@ void wait_for_mongo_migration_action(int flag)
     if (flag == 3) {
         // 移送先での再開通知はQEMUをブロック(デッドロック)させないよう即座にリターン
         fprintf(stderr, "[MIG-INFO] Signal 3 (Resume) sent async.\n");
+        fprintf(stderr, "Successfully restored %lu pages directly from disk.\n", restored_pages_count);
         return;
     }
 
@@ -3722,7 +3721,6 @@ void output_migration_experiment_results(void)
             " Actually Skipped  : %lu pages\n"
             " True Dirty Cancel : %lu pages\n"
             " Skipped Size      : %.2f GB (%lu bytes)\n"
-            " Successfully restored %lu pages directly from disk.\n"
             " CSV log saved to  : %s\n"
             " =================================\n",
             time_buf, (int)(tv.tv_usec / 1000), 
@@ -3730,7 +3728,6 @@ void output_migration_experiment_results(void)
             actual_skipped_pages, 
             total_canceled_pages,
             skip_bytes / (1024.0 * 1024.0 * 1024.0), skip_bytes,
-            restored_pages_count,
             csv_path);
 }
 
