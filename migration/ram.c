@@ -4979,6 +4979,8 @@ static int ram_load_precopy(QEMUFile *f)
             //launch_mongo_prefetch_thread(metadata, metadata_size);
             break;
         case RAM_SAVE_FLAG_SKIPPED:
+            RAMBlock *block = ram_block_from_stream(mis, f, flags, RAM_CHANNEL_PRECOPY);
+            if (!block) { ret = -EINVAL; break; }
             // 1. block と addr を使ってLBAを検索
             uint64_t lba = lookup_lba_by_ram_offset(block, addr);
             
