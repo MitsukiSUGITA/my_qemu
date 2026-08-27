@@ -2306,7 +2306,16 @@ bool consume_skipbitmap_token(RAMBlock *block, uint64_t ram_offset)
     if (gpfn >= (mongo_bitmap_size * 8)) return false;
 
     // 該当ページのクリーン状態をアトミックに読み取りつつ，消費(0クリア)する
+    volatile uint8_t *bmp = (volatile uint8_t *)mongo_shared_bitmap;
     uint8_t mask = 1 << (gpfn % 8);
+
+    // アトミック命令を撃つ前に、普通のメモリアクセスで「ビットが0か」を確認する
+    // 99%のページはここで弾かれるため、CPUバスロックが一切発生しない
+    if ((bmp[gpfn / 8] & mask) == 0) {
+        return false; 
+    }
+
+    // 3. 本当にビットが1だった「スキップ対象のページ」だけ、アトミックに消費（0クリア）する
     return (__sync_fetch_and_and(&mongo_shared_bitmap[gpfn / 8], ~mask) & mask) != 0;
 }
 
@@ -3384,8 +3393,8 @@ void mmap_shared_bitmap(void)
         // マップ失敗時はOSの具体的なエラー理由(errno)を併記して警告
         fprintf(stderr, "[MIG-WARN] Failed to mmap mongo_bitmap: %s\n", strerror(errno));
     } else {
-        fprintf(stderr, "[MIG-INFO] mongo_bitmap mapped for Zero-Copy skip.\n");
-    }
+        memset(mongo_shared_bitmap, 0, mongo_bitmap_size);
+        fprintf(stderr, "[MIG-INFO] mongo_bitmap mapped and ZERO-CLEARED for Zero-Copy skip.\n");    }
 }
 
 /*
