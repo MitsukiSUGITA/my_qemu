@@ -97,6 +97,7 @@ static uint64_t restored_pages_count = 0;
 typedef struct {
     uint8_t *metadata;
     size_t size;
+    BlockBackend *blk;
 } MongoPrefetchArgs;
 
 // スキップページ復元機構
@@ -116,6 +117,7 @@ typedef struct {
 static LbaMapTable g_lba_map_table = {0, NULL};
 
 /* RAMオフセットから対象のLBAを探索する関数 */
+/*
 static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
 {
     if (!g_lba_map_table.entries || g_lba_map_table.entry_num == 0) return 0;
@@ -133,6 +135,7 @@ static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
     }
     return 0; // 見つからなかった場合
 }
+*/
 
 #if defined(__linux__)
 #include "qemu/userfaultfd.h"
@@ -4723,50 +4726,70 @@ static GlobalRestoreMeta * deserialize_metadata(MongoPrefetchArgs *args)
     
     return meta;
 }
+*/
 
-// 生成された別スレッドで独立して動く，並列復元を行うメイン関数
-static void mongo_prefeth_worker(void *opaque)
+// 🌟 バックグラウンドでQCOW2から復元を行うワーカースレッド
+static void *mongo_prefetch_worker(void *opaque)
 {
-    int fd;
-    // 1. 受け取った引数を元の構造体にキャスト
     MongoPrefetchArgs *args = (MongoPrefetchArgs *)opaque;
-    fprintf(stderr, "[MIG-INFO] Background thread started. Processing %zu bytes.\n", args->size);
+    BlockBackend *blk = args->blk;
 
-    // ----------------------------------------------------
-    // 【Step 3, 4の処理がここに入ります】
-    // - デシリアライズ処理
-    GlobalRestoreMeta *meta = deserialize_metadata(args);
-    // - virtio-fs経由での open() と pread() 連打
-    for (int i = 0; i < meta->file_num; i++) {
-        FileGroupMeta *file = &meta->files[i];
-        fd = open(file->f_name, O_RDONLY);
-        pread(fd, dest_addr, size, file_offset)
+    fprintf(stderr, "[PREFETCH] QCOW2 Background thread started. Entries: %u\n", g_lba_map_table.entry_num);
+
+    RAMBlock *block = qemu_ram_block_by_name("pc.ram");
+    if (!block) {
+        fprintf(stderr, "[PREFETCH-FATAL] pc.ram block not found\n");
+        g_free(args);
+        return NULL;
     }
-    // ----------------------------------------------------
 
-    // 2. 使い終わった引数構造体とデータは【必ずこのスレッド内で】解放
-    g_free(args->metadata); // qemu_get_buffer用に確保したメモリ
-    g_free(args);           // 引数パッケージ用のメモリ
+    for (uint32_t i = 0; i < g_lba_map_table.entry_num; i++) {
+        uint64_t gpfn = g_lba_map_table.entries[i].gpfn;
+        uint64_t lba  = g_lba_map_table.entries[i].lba;
 
-    fprintf(stderr, "[MIG-INFO] Background thread finished successfully.\n");
+        if (lba > 0) {
+            uint64_t gpa = gpfn << TARGET_PAGE_BITS;
+            // PCIホールの逆変換
+            uint64_t ram_offset = (gpa >= 0x100000000ULL) ? (gpa - 0x40000000ULL) : gpa;
+            void *host_addr = block->host + ram_offset;
+
+            // 🌟 OSのpreadではなく、QEMUのblk_preadを使用！
+            // これによりQCOW2の複雑なアドレス変換をQEMUが自動で処理してくれる
+            int ret = blk_pread(blk, lba * 512, TARGET_PAGE_SIZE, host_addr, 0);
+            if (ret < 0) {
+                fprintf(stderr, "[PREFETCH-WARN] blk_pread failed at LBA: %lu\n", (unsigned long)lba);
+            }
+        }
+    }
+
+    fprintf(stderr, "[PREFETCH] QCOW2 Background thread finished successfully.\n");
+    g_free(args); // メモリリーク防止
     return NULL;
 }
 
-// メインスレッドから呼ばれる，並列復元スレッドを生成する関数
-static void launch_mongo_prefetch_thread(uint8_t *metadata, size_t size)
+// 🌟 メタデータ受信時 (Signal 1) にメインスレッドから呼ばれる起動関数
+static void launch_mongo_prefetch_thread(void)
 {
-    // 1. 引数構造体用にメモリを確保し、データを詰める (g_new0 はゼロ埋めして確保)
+    // 1. メインスレッド側で安全に BlockBackend を取得する
+    BlockBackend *blk = blk_by_name("mongo-disk");
+    if (!blk) {
+        blk = blk_next(NULL); // 見つからなければ最初のブロックデバイスをフォールバック
+    }
+    
+    if (!blk) {
+        fprintf(stderr, "[PREFETCH-FATAL] BlockBackend not found!\n");
+        return;
+    }
+
+    // 2. 引数構造体に BlockBackend のポインタを詰める
     MongoPrefetchArgs *args = g_new0(MongoPrefetchArgs, 1);
-    args->metadata = metadata;
-    args->size = size;
+    args->blk = blk;
 
-    // 2. QEMUのスレッドオブジェクトを用意
+    // 3. バックグラウンドスレッドを切り離しモードで生成
     QemuThread thread;
-
-    // 3. スレッドを生成(QEMU_THREAD_DETACHED:スレッドを切り離しモードで起動)
-    qemu_thread_create(&thread, "mongo_prefetch", mongo_prefeth_worker, args, QEMU_THREAD_DETACHED);
+    qemu_thread_create(&thread, "mongo_prefetch", mongo_prefetch_worker, args, QEMU_THREAD_DETACHED);
 }
-*/
+
 /**
  * ram_load_precopy: load pages in precopy case
  *
@@ -4982,36 +5005,11 @@ static int ram_load_precopy(QEMUFile *f)
 
             // 4. ここでバックグラウンドスレッドを立ち上げ、
             // metadata を渡して裏で pread を走らせる！
-            //launch_mongo_prefetch_thread(metadata, metadata_size);
+            launch_mongo_prefetch_thread();
             break;
         case RAM_SAVE_FLAG_SKIPPED:
             RAMBlock *block = ram_block_from_stream(mis, f, flags, RAM_CHANNEL_PRECOPY);
             if (!block) { ret = -EINVAL; break; }
-            // 1. block と addr を使ってLBAを検索
-            uint64_t lba = lookup_lba_by_ram_offset(block, addr);
-            
-            if (lba > 0) {
-                BlockBackend *blk = blk_by_name("mongo-disk");
-                if (!blk) {
-                    blk = blk_next(NULL);
-                }
-
-                if (blk) {
-                    // 2. host へディスクから4096バイトを直接流し込む
-                    int pread_ret = blk_pread(blk, lba * 512, TARGET_PAGE_SIZE, host, 0);
-                    
-                    if (pread_ret < 0) {
-                        fprintf(stderr, "[RESTORE-FATAL] blk_pread failed for LBA: %lu\n", lba);
-                        ret = -EIO; 
-                    }
-                } else {
-                    fprintf(stderr, "[RESTORE-FATAL] BlockBackend not found!\n");
-                    ret = -EIO;
-                }
-            } else {
-                fprintf(stderr, "[RESTORE-FATAL] LBA not found for offset: 0x%lx\n", (unsigned long)addr);
-                ret = -EINVAL;
-            }            
             break;
         default:
             error_report("Unknown combination of migration flags: 0x%x", flags);
