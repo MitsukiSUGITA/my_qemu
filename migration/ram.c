@@ -92,7 +92,6 @@ uint64_t actual_skipped_pages = 0;              /* 提案手法によって実�
 uint64_t total_canceled_pages = 0;              /* ゲストの再書き込み等によりスキップ判定を破棄(再送)したページ数 */
 double   mig_cpu_start        = 0.0;            /* QEMU移送スレッドのベースラインCPU時間 (開始時・秒) */
 double   mig_cpu_end          = 0.0;            /* QEMU移送スレッドの完了時CPU時間 (終了時・秒) */
-static uint64_t restored_pages_count = 0;
 /* --- 4. スレッドに渡すための引数パッケージ --- */
 typedef struct {
     uint8_t *metadata;
@@ -116,6 +115,17 @@ typedef struct {
 
 static LbaMapTable g_lba_map_table = {0, NULL};
 
+volatile uint8_t *g_mongo_page_received = NULL; // ネットワーク受信保護マップ
+volatile int g_prefetch_completed_count = 0;    // 完了したスレッド数
+#define PREFETCH_THREADS 16                     // 16並列でディスクを叩く
+
+typedef struct {
+    BlockBackend *blk;
+    uint32_t start_idx;
+    uint32_t end_idx;
+} PrefetchCoArgs;
+
+
 /* RAMオフセットから対象のLBAを探索する関数 */
 /*
 static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
@@ -136,6 +146,30 @@ static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
     return 0; // 見つからなかった場合
 }
 */
+
+static void acquire_network_page_lock(ram_addr_t addr) {
+    if (!g_mongo_page_received) return;
+    
+    uint64_t page_idx = addr >> TARGET_PAGE_BITS;
+    uint8_t expected;
+    
+    // CPUのハードウェア命令を使ってアトミックに状態を遷移させる
+    while (1) {
+        // 状態 0 (初期) から 1 (ネットワーク確保) へ遷移を試みる
+        expected = __sync_val_compare_and_swap(&g_mongo_page_received[page_idx], 0, 1);
+        if (expected == 0) return; // 成功
+        
+        // 状態 3 (ディスク書き込み完了) から 1 (ネットワーク上書き確保) へ遷移を試みる
+        expected = __sync_val_compare_and_swap(&g_mongo_page_received[page_idx], 3, 1);
+        if (expected == 3) return; // 成功
+        
+        // すでに 1 の場合は何もしない（重複パケット等）
+        if (expected == 1) return;
+        
+        // もし expected == 2 の場合、コルーチンがまさに今 memcpy を実行中！
+        // 衝突を防ぐため、コルーチンが終わるまで数マイクロ秒だけ空回りで待つ（スピンロック）
+    }
+}
 
 #if defined(__linux__)
 #include "qemu/userfaultfd.h"
@@ -3289,9 +3323,13 @@ void wait_for_mongo_migration_action(int flag)
     mongo_command_flag = flag; // ゲストのポーリング用フラグ(1:収集, 2:退避, 3:再開)をセット
 
     if (flag == 3) {
-        // 移送先での再開通知はQEMUをブロック(デッドロック)させないよう即座にリターン
-        fprintf(stderr, "[MIG-INFO] Signal 3 (Resume) sent async.\n");
-        fprintf(stderr, "Successfully restored %lu pages directly from disk.\n", restored_pages_count);
+        // 16個のコルーチンが全て終わるまで待機
+        while (g_prefetch_completed_count < PREFETCH_THREADS) {
+            aio_poll(qemu_get_aio_context(), true);
+        }
+        
+        fprintf(stderr, "[PREFETCH] All 16 background restores completed. Safe to resume VM.\n");
+
         return;
     }
 
@@ -4728,66 +4766,90 @@ static GlobalRestoreMeta * deserialize_metadata(MongoPrefetchArgs *args)
 }
 */
 
-// 🌟 バックグラウンドでQCOW2から復元を行うワーカースレッド
-static void *mongo_prefetch_worker(void *opaque)
+// 🌟 1. バックグラウンドで動く「コルーチン」のワーカー関数
+static void mongo_prefetch_co_entry(void *opaque)
 {
-    MongoPrefetchArgs *args = (MongoPrefetchArgs *)opaque;
-    BlockBackend *blk = args->blk;
-
-    fprintf(stderr, "[PREFETCH] QCOW2 Background thread started. Entries: %u\n", g_lba_map_table.entry_num);
-
+    PrefetchCoArgs *args = (PrefetchCoArgs *)opaque;
     RAMBlock *block = qemu_ram_block_by_name("pc.ram");
-    if (!block) {
-        fprintf(stderr, "[PREFETCH-FATAL] pc.ram block not found\n");
-        g_free(args);
-        return NULL;
-    }
 
-    for (uint32_t i = 0; i < g_lba_map_table.entry_num; i++) {
+    // 直接ホストメモリを触らず、一時的な「バウンスバッファ」を確保する
+    void *bounce_buf = g_malloc(TARGET_PAGE_SIZE);
+
+    for (uint32_t i = args->start_idx; i < args->end_idx; i++) {
         uint64_t gpfn = g_lba_map_table.entries[i].gpfn;
         uint64_t lba  = g_lba_map_table.entries[i].lba;
 
         if (lba > 0) {
             uint64_t gpa = gpfn << TARGET_PAGE_BITS;
-            // PCIホールの逆変換
             uint64_t ram_offset = (gpa >= 0x100000000ULL) ? (gpa - 0x40000000ULL) : gpa;
-            void *host_addr = block->host + ram_offset;
+            uint64_t page_idx = ram_offset >> TARGET_PAGE_BITS;
+            
+            // 1回目のチェック：既にネットワークから届いていればスキップ
+            if (g_mongo_page_received && g_mongo_page_received[page_idx]) {
+                continue; 
+            }
 
-            // 🌟 OSのpreadではなく、QEMUのblk_preadを使用！
-            // これによりQCOW2の複雑なアドレス変換をQEMUが自動で処理してくれる
-            int ret = blk_pread(blk, lba * 512, TARGET_PAGE_SIZE, host_addr, 0);
+            // ホストメモリ(host_addr)ではなく、一時バッファ(bounce_buf)へ読み込む！
+            // 読み込んでいる最中は Yield され、ネットワーク受信処理が進む
+            int ret = blk_co_pread(args->blk, lba * 512, TARGET_PAGE_SIZE, bounce_buf, 0);
+
+            // 2回目のチェック：ディスクから読み込んでいる間に、ネットワークから最新データが届かなかったか再確認する
+            if (ret == 0 && g_mongo_page_received && !g_mongo_page_received[page_idx]) {
+                // 🌟 状態 0 (初期) の場合のみ、状態 2 (memcpy中) へ遷移させる
+                if (__sync_bool_compare_and_swap(&g_mongo_page_received[page_idx], 0, 2)) {
+                    
+                    // 状態 2 を確保したので、ネットワーク受信と絶対に衝突しない！安全にコピー
+                    void *host_addr = block->host + ram_offset;
+                    memcpy(host_addr, bounce_buf, TARGET_PAGE_SIZE);
+                    
+                    // 🌟 コピーが終わったら状態 3 (ディスク完了) に変更し、ロックを解放する
+                    __sync_lock_test_and_set(&g_mongo_page_received[page_idx], 3);
+                }
+            }
+
             if (ret < 0) {
-                fprintf(stderr, "[PREFETCH-WARN] blk_pread failed at LBA: %lu\n", (unsigned long)lba);
+                fprintf(stderr, "[PREFETCH-WARN] blk_co_pread failed at LBA: %lu\n", (unsigned long)lba);
             }
         }
     }
 
-    fprintf(stderr, "[PREFETCH] QCOW2 Background thread finished successfully.\n");
-    g_free(args); // メモリリーク防止
-    return NULL;
+    // 一時バッファを解放
+    g_free(bounce_buf);
+
+    // コルーチン完了をカウントアップ (アトミック操作)
+    __sync_fetch_and_add(&g_prefetch_completed_count, 1);
+    g_free(args);
 }
 
-// 🌟 メタデータ受信時 (Signal 1) にメインスレッドから呼ばれる起動関数
+// 🌟 2. メタデータ受信時 (Signal 1) に呼ばれる起動関数
 static void launch_mongo_prefetch_thread(void)
 {
-    // 1. メインスレッド側で安全に BlockBackend を取得する
+    // 保護マップの初期化 (4GBメモリなら1MBの配列で十分)
+    if(!g_mongo_page_received) {
+        g_mongo_page_received = g_malloc0(1048576);
+    } else {
+        memset((void*)g_mongo_page_received, 0, 1048576);
+    }
+
+    // 16個のコルーチンを生成して起動
+    g_prefetch_completed_count = 0;
     BlockBackend *blk = blk_by_name("mongo-disk");
-    if (!blk) {
-        blk = blk_next(NULL); // 見つからなければ最初のブロックデバイスをフォールバック
-    }
-    
-    if (!blk) {
-        fprintf(stderr, "[PREFETCH-FATAL] BlockBackend not found!\n");
-        return;
-    }
+    if(!blk) blk = blk_next(NULL);
 
-    // 2. 引数構造体に BlockBackend のポインタを詰める
-    MongoPrefetchArgs *args = g_new0(MongoPrefetchArgs, 1);
-    args->blk = blk;
+    if(blk) {
+        uint32_t total = g_lba_map_table.entry_num;
+        uint32_t chunk = total / PREFETCH_THREADS;
 
-    // 3. バックグラウンドスレッドを切り離しモードで生成
-    QemuThread thread;
-    qemu_thread_create(&thread, "mongo_prefetch", mongo_prefetch_worker, args, QEMU_THREAD_DETACHED);
+        for (int i = 0; i < PREFETCH_THREADS; i++) {
+            PrefetchCoArgs *args = g_new0(PrefetchCoArgs, 1);
+            args->blk = blk;
+            args->start_idx = i * chunk;
+            args->end_idx = (i == PREFETCH_THREADS - 1) ? total : (i + 1) * chunk;
+
+            Coroutine *co = qemu_coroutine_create(mongo_prefetch_co_entry, args);
+            qemu_coroutine_enter(co);
+        }
+    }
 }
 
 /**
@@ -4934,11 +4996,19 @@ static int ram_load_precopy(QEMUFile *f)
                 ret = -EINVAL;
                 break;
             }
+            // 🌟 ゼロページ書き込み前にもロックを取得
+            acquire_network_page_lock(addr);
             ram_handle_zero(host, TARGET_PAGE_SIZE);
             break;
 
         case RAM_SAVE_FLAG_PAGE:
+            // 🌟 実データ書き込み前にロックを取得（これで memcpy との衝突が物理的に不可能になる）
+            acquire_network_page_lock(addr);
             qemu_get_buffer(f, host, TARGET_PAGE_SIZE);
+            // 最新データをネットワークから受け取ったらフラグを立てる（上書き防止）
+            if (g_mongo_page_received) {
+                g_mongo_page_received[addr >> TARGET_PAGE_BITS] = 1;
+            }
             break;
 
         case RAM_SAVE_FLAG_XBZRLE:
