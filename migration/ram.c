@@ -153,6 +153,15 @@ static uint32_t mongo_page_crc(const uint8_t *p)
 }
 
 /*
+ * 計測(スキップの安全性・復元内容の照合)を行うか。移送元・移送先それぞれのホストに
+ * /tmp/mongo_mig_measure_on があるときだけ行う(既定は行わない。性能の実験を歪めないため)。
+ */
+static bool mongo_measure_enabled(void)
+{
+    return access("/tmp/mongo_mig_measure_on", F_OK) == 0;
+}
+
+/*
  * 診断用: ゲストの RAM(pc.ram)全体について、ページごとの CRC を path に書き出す(uint32 の配列、RAM オフセット順)。
  * 移送元は移送完了時(VM 停止済み)、移送先は復元の完了を待ち終えた直後(VM を動かす前)に呼び、
  * 両者を突き合わせて「移送後のメモリ全体が移送元と同一か」を確かめる。
@@ -3692,7 +3701,7 @@ void wait_for_mongo_migration_action(int flag)
      * 変化していないかを照合できるようにする(診断用の計装)。
      * ゲストRAMを読むだけなので BQL は要らない。BQL を握ったまま走らせると
      * その間ゲストのI/Oが止まり、計測が実験そのものを歪めるため、再取得の前に行う。 */
-    if (flag == 1 && mongo_done_flag == 1) {
+    if (flag == 1 && mongo_done_flag == 1 && mongo_measure_enabled()) {
         mongo_snapshot_skip_candidates();
     }
 
@@ -4082,6 +4091,7 @@ void output_migration_experiment_results(void)
             " Actually Skipped  : %lu pages\n"
             " True Dirty Cancel : %lu pages\n"
             " Skipped Size      : %.2f GB (%lu bytes)\n"
+            " Skip Measurement  : %s\n"
             " Safe Skips        : %lu pages\n"
             " Unsafe Skips      : %lu pages\n"
             " Recovered Skips   : %lu pages\n"
@@ -4096,6 +4106,7 @@ void output_migration_experiment_results(void)
             actual_skipped_pages,
             total_canceled_pages,
             skip_bytes / (1024.0 * 1024.0 * 1024.0), skip_bytes,
+            mongo_skip_state ? "ON" : "OFF (/tmp/mongo_mig_measure_on が無いため、以下の計測値は 0)",
             mongo_safe_skips,
             mongo_unsafe_skips,
             mongo_recovered_skips,
@@ -4108,7 +4119,7 @@ void output_migration_experiment_results(void)
     /* スキップしたページを1行ずつ書き出す。移送先が復元した内容の CRC と、
      * ページ番号(GPFN)で突き合わせるため。移送元の VM は既に止まっているので、
      * ここで時間を使ってもダウンタイムには影響しない。 */
-    FILE *dump = fopen("/tmp/mongo_src_pages.csv", "w");
+    FILE *dump = mongo_skip_state ? fopen("/tmp/mongo_src_pages.csv", "w") : NULL;
     if (dump && mongo_skip_state) {
         fprintf(dump, "gpfn,state,sig1_crc,crc_mode\n");
         for (uint64_t p = 0; p < mongo_track_npages; p++) {
@@ -5149,7 +5160,9 @@ static void mongo_prefetch_co_entry(void *opaque)
             
             // 1回目のチェック：既にネットワークから届いていればスキップ
             if (g_mongo_page_received && g_mongo_page_received[page_idx]) {
-                g_restore_outcome[i] = RESTORE_NET_BEFORE;
+                if (g_restore_outcome) {
+                    g_restore_outcome[i] = RESTORE_NET_BEFORE;
+                }
                 continue;
             }
 
@@ -5158,11 +5171,13 @@ static void mongo_prefetch_co_entry(void *opaque)
             int ret = blk_co_pread(args->blk, lba * 512, TARGET_PAGE_SIZE, bounce_buf, 0);
 
             // 計測: ディスクから読んだ内容の CRC を記録する(書き込めたら下で結果を上書き)
-            if (ret == 0) {
-                g_restore_crc[i] = mongo_page_crc(bounce_buf);
-                g_restore_outcome[i] = RESTORE_NET_DURING;
-            } else {
-                g_restore_outcome[i] = RESTORE_READ_ERR;
+            if (g_restore_outcome) {
+                if (ret == 0) {
+                    g_restore_crc[i] = mongo_page_crc(bounce_buf);
+                    g_restore_outcome[i] = RESTORE_NET_DURING;
+                } else {
+                    g_restore_outcome[i] = RESTORE_READ_ERR;
+                }
             }
 
             // 2回目のチェック：ディスクから読み込んでいる間に、ネットワークから最新データが届かなかったか再確認する
@@ -5176,7 +5191,9 @@ static void mongo_prefetch_co_entry(void *opaque)
                     
                     // 🌟 コピーが終わったら状態 3 (ディスク完了) に変更し、ロックを解放する
                     __sync_lock_test_and_set(&g_mongo_page_received[page_idx], 3);
-                    g_restore_outcome[i] = RESTORE_WRITTEN;
+                    if (g_restore_outcome) {
+                        g_restore_outcome[i] = RESTORE_WRITTEN;
+                    }
                 }
             }
 
@@ -5205,13 +5222,18 @@ static void launch_mongo_prefetch_thread(void)
     }
 
     // 計測: エントリごとの復元結果と CRC の記録場所(全て RESTORE_NOLBA / 0 で始まる)
+    // 計測しないとき(既定)は記録場所を用意せず、復元のたびの CRC の計算もしない
     g_free(g_restore_outcome);
     g_free(g_restore_crc);
-    g_restore_outcome = g_new0(uint8_t,  g_lba_map_table.entry_num);
-    g_restore_crc     = g_new0(uint32_t, g_lba_map_table.entry_num);
+    g_restore_outcome = NULL;
+    g_restore_crc = NULL;
+    if (mongo_measure_enabled()) {
+        g_restore_outcome = g_new0(uint8_t,  g_lba_map_table.entry_num);
+        g_restore_crc     = g_new0(uint32_t, g_lba_map_table.entry_num);
 #if defined(__x86_64__)
-    mongo_crc_hw = __builtin_cpu_supports("sse4.2");   // 移送元と同じ CRC を使う
+        mongo_crc_hw = __builtin_cpu_supports("sse4.2");   // 移送元と同じ CRC を使う
 #endif
+    }
 
     // 16個のコルーチンを生成して起動
     g_prefetch_completed_count = 0;
