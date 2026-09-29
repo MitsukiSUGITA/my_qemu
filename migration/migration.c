@@ -849,6 +849,7 @@ static void process_incoming_migration_bh(void *opaque)
                 // 移送先VMの再開を検知し、MongoDBへフェーズ4（再開通知）のシグナルを送信
                 wait_for_mongo_migration_action(3);
                 fprintf(stderr, "[MIG-INFO] Target VM resumed.\n");
+                fprintf(stderr, "[MIG-TIME] vm_resumed %.3f\n", g_get_real_time() / 1e6); /* 診断用: 時系列の突き合わせ */
 #endif
             }
         } else {
@@ -3484,6 +3485,7 @@ static void *mongo_barrier_worker(void *opaque)
     // メインスレッドに最終フェーズ（switchover）への移行を許可するため、状態をアトミックに更新
     qatomic_set(&mongo_state, MONGO_BARRIER_COMPLETED);
     fprintf(stderr, "[MIG-INFO] Async barrier completed. Switchover unlocked.\n");
+    fprintf(stderr, "[MIG-TIME] switchover_unlocked %.3f\n", g_get_real_time() / 1e6); /* 診断用: 時系列の突き合わせ */
     return NULL;
 }
 #endif

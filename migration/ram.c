@@ -66,6 +66,10 @@
 #include "system/block-backend-global-state.h"
 #include "system/block-backend-io.h"
 #include "qemu/memalign.h"
+#include "qemu/crc32c.h"
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 #include "hw/boards.h" /* for machine_dump_guest_core() */
 
@@ -90,6 +94,101 @@ static bool   mongo_sem_initialized = false;    /* セマフォの二重初期�
 /* --- 3. 計測・統計 (実験メトリクス) 関連 --- */
 uint64_t actual_skipped_pages = 0;              /* 提案手法によって実際にパケット送信をスキップできたページ数 */
 uint64_t total_canceled_pages = 0;              /* ゲストの再書き込み等によりスキップ判定を破棄(再送)したページ数 */
+
+/* --- 3b. スキップ安全性の計測 (診断用。機構の動作そのものは変えない) ---
+ *
+ * 「Signal 1 の時点でクリーンと判定されたページが、その後書き換えられたにも関わらず
+ *  スキップされていないか」を実測するための計装。ダーティビットマップは
+ *  「まだ送っていない」と「書かれた」が混ざって区別できないため、
+ *  ページ内容のCRCを直接比較する。
+ *
+ * 索引は RAMBlock("pc.ram") 内のページ番号(pss->page, rb->bmap と同じ番号)。
+ * GPFN で索引すると PCI ホールより上(GPA 4GB以上)に置かれたRAMが範囲外になり、
+ * 黙って計測から漏れる。GPFN からの変換は Signal 1 でゲストのビットマップを
+ * 読むときの1か所だけで行う。 */
+#define MONGO_SKIP_NONE      0                  /* Signal 1 の候補でない */
+#define MONGO_SKIP_CANDIDATE 1                  /* 候補(ベースライン記録済み) */
+#define MONGO_SKIP_SAFE      2                  /* Signal 1 と内容一致のままスキップ(正しい) */
+#define MONGO_SKIP_UNSAFE    3                  /* 内容が変化していたのにスキップ(危険) */
+#define MONGO_SKIP_RECOVERED 4                  /* UNSAFE だが後で再送され無害化 */
+#define MONGO_SKIP_SAFE_RESENT 5                /* SAFE だったが、その後書き換えられて再送された */
+static uint32_t *mongo_sig1_hash    = NULL;     /* Signal 1 時点の各ページのCRC */
+static uint8_t  *mongo_skip_state   = NULL;     /* 上記 MONGO_SKIP_* の状態 */
+static uint64_t  mongo_track_npages = 0;        /* 上の2配列の要素数 = pc.ram のページ数 */
+static bool      mongo_crc_hw       = false;    /* CPUのCRC32命令を使うか(1回の移送の中では固定) */
+uint64_t mongo_safe_skips          = 0;
+uint64_t mongo_unsafe_skips        = 0;
+uint64_t mongo_recovered_skips     = 0;
+uint64_t mongo_noncandidate_skips  = 0;         /* 候補でないページのスキップ。0でなければならない */
+uint64_t mongo_double_skips        = 0;         /* 同一ページの2回目のスキップ。0でなければならない */
+
+/*
+ * ページ1枚分のCRC。QEMU の crc32c() は1バイトずつ表を引くソフトウェア実装で、
+ * 16万ページのベースライン記録に2秒以上かかっていた。記録中にゲストが書いた内容は
+ * 基準に吸収されてしまう(=計測の死角になる)ため、CPUのCRC32命令で8バイトずつ処理する。
+ * ベースラインとスキップ時の照合で同じ関数を使うので、値が crc32c() と違っても問題ない。
+ */
+#if defined(__x86_64__)
+static uint32_t __attribute__((target("sse4.2")))
+mongo_page_crc_hw(const uint8_t *p)
+{
+    uint64_t crc = 0xffffffff;
+    for (size_t i = 0; i < TARGET_PAGE_SIZE; i += 8) {
+        uint64_t v;
+        memcpy(&v, p + i, sizeof(v));
+        crc = _mm_crc32_u64(crc, v);
+    }
+    return (uint32_t)crc;
+}
+#endif
+
+static uint32_t mongo_page_crc(const uint8_t *p)
+{
+#if defined(__x86_64__)
+    if (mongo_crc_hw) {
+        return mongo_page_crc_hw(p);
+    }
+#endif
+    return crc32c(0xffffffff, p, TARGET_PAGE_SIZE);
+}
+
+/*
+ * 診断用: ゲストの RAM(pc.ram)全体について、ページごとの CRC を path に書き出す(uint32 の配列、RAM オフセット順)。
+ * 移送元は移送完了時(VM 停止済み)、移送先は復元の完了を待ち終えた直後(VM を動かす前)に呼び、
+ * 両者を突き合わせて「移送後のメモリ全体が移送元と同一か」を確かめる。
+ * 両ホストに /tmp/mongo_full_mem_compare_on があるときだけ動く(オーケストレータの --full-mem-compare)。
+ * 移送先では VM を動かす前に計算するので、オンのときはそのぶんダウンタイムが延びる。
+ */
+static void mongo_dump_full_ram_crc(const char *path)
+{
+    if (access("/tmp/mongo_full_mem_compare_on", F_OK) != 0) {
+        return;
+    }
+    RCU_READ_LOCK_GUARD();
+    RAMBlock *block = qemu_ram_block_by_name("pc.ram");
+    if (!block) {
+        fprintf(stderr, "[MIG-MEASURE] Full RAM CRC: pc.ram not found\n");
+        return;
+    }
+#if defined(__x86_64__)
+    mongo_crc_hw = __builtin_cpu_supports("sse4.2");   /* 両側で同じ計算方法にそろえる */
+#endif
+    size_t n = block->used_length >> TARGET_PAGE_BITS;
+    uint32_t *crc = g_new(uint32_t, n);
+    int64_t t0 = g_get_monotonic_time();
+    for (size_t i = 0; i < n; i++) {
+        crc[i] = mongo_page_crc(block->host + (i << TARGET_PAGE_BITS));
+    }
+    double sec = (g_get_monotonic_time() - t0) / 1e6;
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(crc, sizeof(uint32_t), n, f);
+        fclose(f);
+    }
+    fprintf(stderr, "[MIG-MEASURE] Full RAM CRC: %zu pages -> %s (%.3f sec, crc=%s)\n",
+            n, path, sec, mongo_crc_hw ? "hw" : "sw");
+    g_free(crc);
+}
 double   mig_cpu_start        = 0.0;            /* QEMU移送スレッドのベースラインCPU時間 (開始時・秒) */
 double   mig_cpu_end          = 0.0;            /* QEMU移送スレッドの完了時CPU時間 (終了時・秒) */
 /* --- 4. スレッドに渡すための引数パッケージ --- */
@@ -118,6 +217,34 @@ static LbaMapTable g_lba_map_table = {0, NULL};
 volatile uint8_t *g_mongo_page_received = NULL; // ネットワーク受信保護マップ
 volatile int g_prefetch_completed_count = 0;    // 完了したスレッド数
 #define PREFETCH_THREADS 16                     // 16並列でディスクを叩く
+
+/* --- 復元の計測 (診断用。復元の動作そのものは変えない) ---
+ * エントリごとに「どうなったか」と「ディスクから読んだ内容の CRC」を記録し、
+ * 移送元が書き出す Signal 1 時点のメモリの CRC と突き合わせる。 */
+#define RESTORE_NOLBA      0   /* LBA が 0 で読まなかった */
+#define RESTORE_NET_BEFORE 1   /* 読む前に既にネットワークで届いていた */
+#define RESTORE_READ_ERR   2   /* ディスク読み込みに失敗 */
+#define RESTORE_NET_DURING 3   /* 読んでいる間にネットワークで届いた */
+#define RESTORE_WRITTEN    4   /* ディスクの内容をゲストのメモリに書き込んだ */
+static uint8_t  *g_restore_outcome = NULL;
+static uint32_t *g_restore_crc     = NULL;
+
+/* VM の再開(ダウンタイム)を遅らせないよう、別スレッドから呼ぶ */
+static void *mongo_dump_restore_results(void *opaque)
+{
+    FILE *f = fopen("/tmp/mongo_dst_restore.csv", "w");
+    if (!f) {
+        return NULL;
+    }
+    fprintf(f, "gpfn,lba,outcome,crc,crc_mode\n");
+    for (uint32_t i = 0; i < g_lba_map_table.entry_num; i++) {
+        fprintf(f, "%" PRIu64 ",%" PRIu64 ",%u,%08x,%s\n",
+                g_lba_map_table.entries[i].gpfn, g_lba_map_table.entries[i].lba,
+                g_restore_outcome[i], g_restore_crc[i], mongo_crc_hw ? "hw" : "sw");
+    }
+    fclose(f);
+    return NULL;
+}
 
 typedef struct {
     BlockBackend *blk;
@@ -1083,12 +1210,33 @@ static uint64_t physical_memory_sync_dirty_bitmap(RAMBlock *rb,
                 unsigned long bits = qatomic_xchg(&src[idx][offset], 0);
 
                 // 再利用検知とスキップキャンセル
+                //
+                // k はダーティビットマップの「ワード索引」であり、1ワードが
+                // BITS_PER_LONG 個のページを表す。一方 mongo_shared_bitmap は
+                // consume_skipbitmap_token() が GPFN(ページ番号)で引いているので、
+                // k をそのままページ番号として使うと参照先が BITS_PER_LONG 倍ずれる。
+                // ワード内の立っているビットを走査し、GPFN へ変換してから取り消す。
                 if (sync_count > 1 && mongo_shared_bitmap && strcmp(rb->idstr, "pc.ram") == 0) {
-                    uint64_t byte_idx = k / 8;
-                    uint8_t bit_mask = 1 << (k % 8);
-                    // ゲストの再書き込み(メモリ再利用)を検知するため、アトミックにビットを確認・クリア
-                    if (__sync_fetch_and_and(&mongo_shared_bitmap[byte_idx], (uint8_t)~bit_mask) & bit_mask) {
-                        total_canceled_pages++;
+                    unsigned long tmp = bits;
+                    while (tmp) {
+                        unsigned long b = ctzl(tmp);
+                        tmp &= tmp - 1;
+
+                        uint64_t ram_offset = ((uint64_t)k * BITS_PER_LONG + b) << TARGET_PAGE_BITS;
+                        // GPAの逆算は consume_skipbitmap_token() と同一にする
+                        uint64_t gpa = ram_offset +
+                            (ram_offset >= 0xC0000000 ? 0x40000000 : 0);
+                        uint64_t gpfn = gpa >> TARGET_PAGE_BITS;
+                        if (gpfn >= (mongo_bitmap_size * 8)) {
+                            continue;
+                        }
+
+                        uint8_t bit_mask = 1 << (gpfn % 8);
+                        // ゲストの再書き込み(メモリ再利用)を検知するため、アトミックにビットを確認・クリア
+                        if (__sync_fetch_and_and(&mongo_shared_bitmap[gpfn / 8],
+                                                 (uint8_t)~bit_mask) & bit_mask) {
+                            total_canceled_pages++;
+                        }
                     }
                 }
 
@@ -2356,6 +2504,62 @@ bool consume_skipbitmap_token(RAMBlock *block, uint64_t ram_offset)
     return (__sync_fetch_and_and(&mongo_shared_bitmap[gpfn / 8], ~mask) & mask) != 0;
 }
 
+/*
+ * スキップを決めた瞬間に、Signal 1 で記録した内容と一致しているかを照合する。
+ * 不一致なら「申告後に書き換えられたページをスキップした」ことになり、
+ * 移送先は古いディスク内容を復元してしまうため危険。
+ */
+static void mongo_record_skip(RAMBlock *block, unsigned long page)
+{
+    /* ここで弾いたスキップは Safe/Unsafe のどちらにも数えられないため、
+     * 完了時の「Unmeasured Skips」に必ず現れる(黙って消えない)。 */
+    if (strcmp(block->idstr, "pc.ram") != 0 ||
+        !mongo_skip_state || page >= mongo_track_npages) {
+        return;
+    }
+
+    switch (mongo_skip_state[page]) {
+    case MONGO_SKIP_CANDIDATE:
+        break;
+    case MONGO_SKIP_NONE:
+        mongo_noncandidate_skips++;
+        return;
+    default:
+        mongo_double_skips++;
+        return;
+    }
+
+    uint32_t now = mongo_page_crc((const uint8_t *)block->host +
+                                  ((uint64_t)page << TARGET_PAGE_BITS));
+    if (now == mongo_sig1_hash[page]) {
+        mongo_skip_state[page] = MONGO_SKIP_SAFE;
+        mongo_safe_skips++;
+    } else {
+        mongo_skip_state[page] = MONGO_SKIP_UNSAFE;
+        mongo_unsafe_skips++;
+    }
+}
+
+/*
+ * 危険なスキップをしたページが、その後に通常送信で送り直されたかを記録する。
+ * 送り直されていれば移送先ではネットワーク受信が優先されるため結果的に無害。
+ * 最後まで送り直されなかったページが「確定した破損」になる。
+ */
+static void mongo_record_resend(RAMBlock *block, unsigned long page)
+{
+    if (strcmp(block->idstr, "pc.ram") != 0 ||
+        !mongo_skip_state || page >= mongo_track_npages) {
+        return;
+    }
+    if (mongo_skip_state[page] == MONGO_SKIP_UNSAFE) {
+        mongo_skip_state[page] = MONGO_SKIP_RECOVERED;
+        mongo_recovered_skips++;
+    } else if (mongo_skip_state[page] == MONGO_SKIP_SAFE) {
+        /* 移送先で最終的に残るのはネットワークで届いた内容なので、復元内容の照合対象から外すための印 */
+        mongo_skip_state[page] = MONGO_SKIP_SAFE_RESENT;
+    }
+}
+
 /**
  * ram_save_host_page: save a whole host page
  *
@@ -2405,7 +2609,8 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
                 pages++;
                 ram_transferred_add(save_page_header(pss, pss->pss_channel, pss->block, offset_in_block | RAM_SAVE_FLAG_SKIPPED));
                 actual_skipped_pages++;
-            } else 
+                mongo_record_skip(pss->block, pss->page);
+            } else
 #endif /* ENABLE_MONGO_SYNC_EXPERIMENT */
             {
             /*
@@ -2419,6 +2624,11 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
             tmppages = ram_save_target_page(rs, pss);
             if (tmppages >= 0) {
                 pages += tmppages;
+#if ENABLE_MONGO_SYNC_EXPERIMENT
+                if (tmppages > 0) {
+                    mongo_record_resend(pss->block, pss->page);
+                }
+#endif
                 /*
                  * Allow rate limiting to happen in the middle of huge pages if
                  * something is sent in the current iteration.
@@ -3314,6 +3524,78 @@ static int read_exact(int fd, uint8_t *buf, size_t size) {
     return 0; // 全量書き込み完了！
 }
 
+/*
+ * Signal 1 の時点で「クリーン」と申告されたページの内容を記録しておく。
+ * 実際にスキップする瞬間にこれと照合することで、
+ * 「申告後に書き換えられたページをスキップしてしまっていないか」を実測する。
+ * 計測専用であり、スキップ可否の判断には一切影響させない。
+ *
+ * ゲストのビットマップは GPFN で並んでいる。ここがGPFNを扱う唯一の場所で、
+ * consume_skipbitmap_token() の変換(RAM オフセット 3GB 以上は GPA を +1GB)の逆を取る。
+ * PCI ホール(GPA 3GB〜4GB)には RAM が無いので、そこに立ったビットは弾いて数える。
+ */
+static void mongo_snapshot_skip_candidates(void)
+{
+    RCU_READ_LOCK_GUARD();
+    RAMBlock *block = qemu_ram_block_by_name("pc.ram");
+    if (!block || !mongo_shared_bitmap) {
+        return;
+    }
+
+    g_free(mongo_sig1_hash);
+    g_free(mongo_skip_state);
+    mongo_track_npages = block->used_length >> TARGET_PAGE_BITS;
+    mongo_sig1_hash    = g_new0(uint32_t, mongo_track_npages);
+    mongo_skip_state   = g_new0(uint8_t, mongo_track_npages);   /* 全て MONGO_SKIP_NONE */
+    mongo_safe_skips = mongo_unsafe_skips = mongo_recovered_skips = 0;
+    mongo_noncandidate_skips = mongo_double_skips = 0;
+
+#if defined(__x86_64__)
+    mongo_crc_hw = __builtin_cpu_supports("sse4.2");
+#endif
+
+    int64_t t0 = g_get_monotonic_time();
+    uint64_t in_bitmap = 0, accepted = 0, rejected_hole = 0, rejected_range = 0;
+
+    for (size_t byte = 0; byte < mongo_bitmap_size; byte++) {
+        uint8_t v = mongo_shared_bitmap[byte];
+        if (!v) {
+            continue;   /* 大半はここで抜ける */
+        }
+        for (int bit = 0; bit < 8; bit++) {
+            if (!(v & (1 << bit))) {
+                continue;
+            }
+            in_bitmap++;
+
+            uint64_t gpa = ((uint64_t)byte * 8 + bit) << TARGET_PAGE_BITS;
+            if (gpa >= 0xC0000000ULL && gpa < 0x100000000ULL) {
+                rejected_hole++;
+                continue;
+            }
+            uint64_t ram_offset = (gpa >= 0x100000000ULL) ? gpa - 0x40000000ULL : gpa;
+            uint64_t page = ram_offset >> TARGET_PAGE_BITS;
+            if (page >= mongo_track_npages) {
+                rejected_range++;
+                continue;
+            }
+
+            mongo_sig1_hash[page]  = mongo_page_crc((const uint8_t *)block->host + ram_offset);
+            mongo_skip_state[page] = MONGO_SKIP_CANDIDATE;
+            accepted++;
+        }
+    }
+
+    fprintf(stderr,
+            "[MIG-MEASURE] Candidates: bitmap=%" PRIu64 " accepted=%" PRIu64
+            " rejected_hole=%" PRIu64 " rejected_range=%" PRIu64 "\n",
+            in_bitmap, accepted, rejected_hole, rejected_range);
+    fprintf(stderr,
+            "[MIG-MEASURE] Baseline: %" PRIu64 " pages in %.3f sec (crc=%s)\n",
+            accepted, (g_get_monotonic_time() - t0) / 1000000.0,
+            mongo_crc_hw ? "hw" : "sw");
+}
+
 /* MongoDBへメモリ収集・退避・再開コマンドを発行し、必要に応じてBQLを管理して完了を待つ */
 void wait_for_mongo_migration_action(int flag)
 {
@@ -3329,6 +3611,17 @@ void wait_for_mongo_migration_action(int flag)
         }
         
         fprintf(stderr, "[PREFETCH] All 16 background restores completed. Safe to resume VM.\n");
+        fprintf(stderr, "[MIG-TIME] restores_completed %.3f\n", g_get_real_time() / 1e6); /* 診断用: 時系列の突き合わせ */
+
+        /* 診断用: 移送後のメモリ全体の比較のため、VM を動かす前(BQL を持ったまま)の状態を書き出す(オンのときだけ) */
+        mongo_dump_full_ram_crc("/tmp/mongo_full_ram_dst.bin");
+
+        // 計測: 復元結果の書き出しは、VM の再開を遅らせないよう別スレッドで行う
+        if (g_restore_outcome && g_restore_crc) {
+            QemuThread dump_thread;
+            qemu_thread_create(&dump_thread, "mongo-dump", mongo_dump_restore_results,
+                               NULL, QEMU_THREAD_DETACHED);
+        }
 
         return;
     }
@@ -3356,6 +3649,7 @@ void wait_for_mongo_migration_action(int flag)
     }
     
     fprintf(stderr, "[MIG-INFO] Signal %d sent. Waiting for guest...\n", flag);
+    fprintf(stderr, "[MIG-TIME] signal_sent %.3f\n", g_get_real_time() / 1e6); /* 診断用: 時系列の突き合わせ */
 
     // ゲストVMにCPU時間を割り当てて処理を進めさせるため，QEMU大域ロック(BQL)を一時解放
     bool locked = bql_locked(); // 現在のスレッドがBQLを保持しているか確認
@@ -3394,6 +3688,14 @@ void wait_for_mongo_migration_action(int flag)
     qemu_sem_wait(&mongo_clear_sem); 
     fprintf(stderr, "[CHK 3] Sem acquired! Relocking BQL...\n");
 
+    /* スキップ候補ページの内容を記録しておき、実際にスキップする時点で
+     * 変化していないかを照合できるようにする(診断用の計装)。
+     * ゲストRAMを読むだけなので BQL は要らない。BQL を握ったまま走らせると
+     * その間ゲストのI/Oが止まり、計測が実験そのものを歪めるため、再取得の前に行う。 */
+    if (flag == 1 && mongo_done_flag == 1) {
+        mongo_snapshot_skip_candidates();
+    }
+
     if (locked) bql_lock();
 
     // 処理完了のロギングと後始末
@@ -3407,6 +3709,7 @@ void wait_for_mongo_migration_action(int flag)
             }
         }
         fprintf(stderr, "[MIG-INFO] Signal 1 done. Skip pages: %zu\n", skip_count);
+        fprintf(stderr, "[MIG-TIME] signal1_done %.3f\n", g_get_real_time() / 1e6); /* 診断用: 時系列の突き合わせ */
         actual_skipped_pages = 0;
     } else if (flag == 2 && mongo_done_flag == 1) {
         fprintf(stderr, "[MIG-INFO] Signal 2 done. Eviction complete.\n");
@@ -3489,6 +3792,7 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
         ram_transferred_add(16 + rs->mongo_meta_size);
         // 5. 送信が終わったら安全に解放し，ポインタをリセット（リーク防止）
         fprintf(stderr, "[MIG-INFO] Sent MongoDB Metadata (%lu bytes).\n", rs->mongo_meta_size);
+        fprintf(stderr, "[MIG-TIME] metadata_sent %.3f\n", g_get_real_time() / 1e6); /* 診断用: 時系列の突き合わせ */
         free(rs->mongo_meta);
         rs->mongo_meta = NULL;
         rs->mongo_meta_size = 0;
@@ -3765,20 +4069,79 @@ void output_migration_experiment_results(void)
     localtime_r(&tv.tv_sec, &tm_info);
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
 
+    /* 危険なスキップのうち、最後まで送り直されなかったページ = 確定した破損 */
+    uint64_t corrupted = mongo_unsafe_skips - mongo_recovered_skips;
+    /* 実際のスキップ数から差し引きで出す。計測側がどこで取りこぼしても必ずここに現れる。 */
+    uint64_t measured = mongo_safe_skips + mongo_unsafe_skips;
+    uint64_t unmeasured = actual_skipped_pages > measured ?
+                          actual_skipped_pages - measured : 0;
+
     printf( "=== Migration Complete Result ===\n"
             " Completed at      : %s.%03d\n"
             " QEMU Mig CPU Time : %.6f sec\n"
             " Actually Skipped  : %lu pages\n"
             " True Dirty Cancel : %lu pages\n"
             " Skipped Size      : %.2f GB (%lu bytes)\n"
+            " Safe Skips        : %lu pages\n"
+            " Unsafe Skips      : %lu pages\n"
+            " Recovered Skips   : %lu pages\n"
+            " CORRUPTED Pages   : %lu pages\n"
+            " Unmeasured Skips  : %lu pages\n"
+            " Non-candidate Skips : %lu pages\n"
+            " Double Skips      : %lu pages\n"
             " CSV log saved to  : %s\n"
             " =================================\n",
-            time_buf, (int)(tv.tv_usec / 1000), 
+            time_buf, (int)(tv.tv_usec / 1000),
             mig_cpu_end - mig_cpu_start,
-            actual_skipped_pages, 
+            actual_skipped_pages,
             total_canceled_pages,
             skip_bytes / (1024.0 * 1024.0 * 1024.0), skip_bytes,
+            mongo_safe_skips,
+            mongo_unsafe_skips,
+            mongo_recovered_skips,
+            corrupted,
+            unmeasured,
+            mongo_noncandidate_skips,
+            mongo_double_skips,
             csv_path);
+
+    /* スキップしたページを1行ずつ書き出す。移送先が復元した内容の CRC と、
+     * ページ番号(GPFN)で突き合わせるため。移送元の VM は既に止まっているので、
+     * ここで時間を使ってもダウンタイムには影響しない。 */
+    FILE *dump = fopen("/tmp/mongo_src_pages.csv", "w");
+    if (dump && mongo_skip_state) {
+        fprintf(dump, "gpfn,state,sig1_crc,crc_mode\n");
+        for (uint64_t p = 0; p < mongo_track_npages; p++) {
+            if (mongo_skip_state[p] < MONGO_SKIP_SAFE) {
+                continue;   /* スキップしていないページは出さない */
+            }
+            uint64_t off  = p << TARGET_PAGE_BITS;
+            uint64_t gpfn = (off + (off >= 0xC0000000ULL ? 0x40000000ULL : 0)) >> TARGET_PAGE_BITS;
+            fprintf(dump, "%" PRIu64 ",%u,%08x,%s\n", gpfn, mongo_skip_state[p],
+                    mongo_sig1_hash[p], mongo_crc_hw ? "hw" : "sw");
+        }
+    }
+    if (dump) {
+        fclose(dump);
+    }
+
+    /* 診断用: 移送後のメモリ全体の比較のため、移送元の最終状態を書き出す(オンのときだけ) */
+    mongo_dump_full_ram_crc("/tmp/mongo_full_ram_src.bin");
+
+    /* 破損したページの位置を少しだけ出しておくと、後から追跡しやすい */
+    if (corrupted > 0 && mongo_skip_state) {
+        int shown = 0;
+        printf(" CORRUPTED pages   :");
+        for (uint64_t p = 0; p < mongo_track_npages && shown < 10; p++) {
+            if (mongo_skip_state[p] == MONGO_SKIP_UNSAFE) {
+                uint64_t off = p << TARGET_PAGE_BITS;
+                uint64_t gpa = off + (off >= 0xC0000000ULL ? 0x40000000ULL : 0);
+                printf(" page=0x%" PRIx64 "(gpa=0x%" PRIx64 ")", p, gpa);
+                shown++;
+            }
+        }
+        printf("\n =================================\n");
+    }
 }
 
 /**
@@ -4786,12 +5149,21 @@ static void mongo_prefetch_co_entry(void *opaque)
             
             // 1回目のチェック：既にネットワークから届いていればスキップ
             if (g_mongo_page_received && g_mongo_page_received[page_idx]) {
-                continue; 
+                g_restore_outcome[i] = RESTORE_NET_BEFORE;
+                continue;
             }
 
             // ホストメモリ(host_addr)ではなく、一時バッファ(bounce_buf)へ読み込む！
             // 読み込んでいる最中は Yield され、ネットワーク受信処理が進む
             int ret = blk_co_pread(args->blk, lba * 512, TARGET_PAGE_SIZE, bounce_buf, 0);
+
+            // 計測: ディスクから読んだ内容の CRC を記録する(書き込めたら下で結果を上書き)
+            if (ret == 0) {
+                g_restore_crc[i] = mongo_page_crc(bounce_buf);
+                g_restore_outcome[i] = RESTORE_NET_DURING;
+            } else {
+                g_restore_outcome[i] = RESTORE_READ_ERR;
+            }
 
             // 2回目のチェック：ディスクから読み込んでいる間に、ネットワークから最新データが届かなかったか再確認する
             if (ret == 0 && g_mongo_page_received && !g_mongo_page_received[page_idx]) {
@@ -4804,6 +5176,7 @@ static void mongo_prefetch_co_entry(void *opaque)
                     
                     // 🌟 コピーが終わったら状態 3 (ディスク完了) に変更し、ロックを解放する
                     __sync_lock_test_and_set(&g_mongo_page_received[page_idx], 3);
+                    g_restore_outcome[i] = RESTORE_WRITTEN;
                 }
             }
 
@@ -4830,6 +5203,15 @@ static void launch_mongo_prefetch_thread(void)
     } else {
         memset((void*)g_mongo_page_received, 0, 1048576);
     }
+
+    // 計測: エントリごとの復元結果と CRC の記録場所(全て RESTORE_NOLBA / 0 で始まる)
+    g_free(g_restore_outcome);
+    g_free(g_restore_crc);
+    g_restore_outcome = g_new0(uint8_t,  g_lba_map_table.entry_num);
+    g_restore_crc     = g_new0(uint32_t, g_lba_map_table.entry_num);
+#if defined(__x86_64__)
+    mongo_crc_hw = __builtin_cpu_supports("sse4.2");   // 移送元と同じ CRC を使う
+#endif
 
     // 16個のコルーチンを生成して起動
     g_prefetch_completed_count = 0;
@@ -5055,6 +5437,7 @@ static int ram_load_precopy(QEMUFile *f)
             // 3. データ本体を受信
             qemu_get_buffer(f, metadata, metadata_size);
             fprintf(stderr, "[MIG-INFO] Received MongoDB Metadata: %zu bytes\n", metadata_size);
+            fprintf(stderr, "[MIG-TIME] metadata_received %.3f\n", g_get_real_time() / 1e6); /* 診断用: 時系列の突き合わせ */
 
             // 古いテーブルがあれば解放し、新しいマッピングを構築
             if (g_lba_map_table.entries) {
@@ -5076,6 +5459,7 @@ static int ram_load_precopy(QEMUFile *f)
             // 4. ここでバックグラウンドスレッドを立ち上げ、
             // metadata を渡して裏で pread を走らせる！
             launch_mongo_prefetch_thread();
+            fprintf(stderr, "[MIG-TIME] restores_launched %.3f\n", g_get_real_time() / 1e6); /* 診断用: 時系列の突き合わせ */
             break;
         case RAM_SAVE_FLAG_SKIPPED:
             RAMBlock *block = ram_block_from_stream(mis, f, flags, RAM_CHANNEL_PRECOPY);
