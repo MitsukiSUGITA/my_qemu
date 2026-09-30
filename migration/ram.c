@@ -2518,7 +2518,8 @@ bool consume_skipbitmap_token(RAMBlock *block, uint64_t ram_offset)
  * 不一致なら「申告後に書き換えられたページをスキップした」ことになり、
  * 移送先は古いディスク内容を復元してしまうため危険。
  */
-static void mongo_record_skip(RAMBlock *block, unsigned long page)
+/* 従来手法のビルド(ENABLE_MONGO_SYNC_EXPERIMENT=0)では呼ばれないため G_GNUC_UNUSED */
+static void G_GNUC_UNUSED mongo_record_skip(RAMBlock *block, unsigned long page)
 {
     /* ここで弾いたスキップは Safe/Unsafe のどちらにも数えられないため、
      * 完了時の「Unmeasured Skips」に必ず現れる(黙って消えない)。 */
@@ -2554,7 +2555,8 @@ static void mongo_record_skip(RAMBlock *block, unsigned long page)
  * 送り直されていれば移送先ではネットワーク受信が優先されるため結果的に無害。
  * 最後まで送り直されなかったページが「確定した破損」になる。
  */
-static void mongo_record_resend(RAMBlock *block, unsigned long page)
+/* 従来手法のビルド(ENABLE_MONGO_SYNC_EXPERIMENT=0)では呼ばれないため G_GNUC_UNUSED */
+static void G_GNUC_UNUSED mongo_record_resend(RAMBlock *block, unsigned long page)
 {
     if (strcmp(block->idstr, "pc.ram") != 0 ||
         !mongo_skip_state || page >= mongo_track_npages) {
@@ -5141,66 +5143,107 @@ static GlobalRestoreMeta * deserialize_metadata(MongoPrefetchArgs *args)
 */
 
 // 🌟 1. バックグラウンドで動く「コルーチン」のワーカー関数
+/* 1回の読み出しでまとめる最大のページ数(128KB)。ディスク上で連続する行(同じブロックのページ)をまとめて読み、
+ * 共有ストレージへの問い合わせの回数を減らす(4KB ずつ読むと、1回ごとの往復の遅さで復元が移送に間に合わなかった) */
+#define RESTORE_MAX_BATCH 32
+
+/*
+ * 1ページ分の書き込み: 読み出したページ buf を、表の行 i のページとしてゲストのメモリへ書き込む。
+ * ネットワークで届いたページは上書きしない(状態 0 のときだけ 2(コピー中)にしてコピーし、終わったら 3(ディスク完了)にする)。
+ */
+static void mongo_restore_one_page(RAMBlock *block, uint32_t i, uint64_t page_idx,
+                                   uint64_t ram_offset, const void *buf, int ret)
+{
+    // 計測: ディスクから読んだ内容の CRC を記録する(書き込めたら下で結果を上書き)
+    if (g_restore_outcome) {
+        if (ret == 0) {
+            g_restore_crc[i] = mongo_page_crc(buf);
+            g_restore_outcome[i] = RESTORE_NET_DURING;
+        } else {
+            g_restore_outcome[i] = RESTORE_READ_ERR;
+        }
+    }
+
+    // 2回目のチェック：ディスクから読み込んでいる間に、ネットワークから最新データが届かなかったか再確認する
+    if (ret == 0 && g_mongo_page_received && !g_mongo_page_received[page_idx]) {
+        // 🌟 状態 0 (初期) の場合のみ、状態 2 (memcpy中) へ遷移させる
+        if (__sync_bool_compare_and_swap(&g_mongo_page_received[page_idx], 0, 2)) {
+
+            // 状態 2 を確保したので、ネットワーク受信と絶対に衝突しない！安全にコピー
+            void *host_addr = block->host + ram_offset;
+            memcpy(host_addr, buf, TARGET_PAGE_SIZE);
+
+            // 🌟 コピーが終わったら状態 3 (ディスク完了) に変更し、ロックを解放する
+            __sync_lock_test_and_set(&g_mongo_page_received[page_idx], 3);
+            if (g_restore_outcome) {
+                g_restore_outcome[i] = RESTORE_WRITTEN;
+            }
+        }
+    }
+}
+
 static void mongo_prefetch_co_entry(void *opaque)
 {
     PrefetchCoArgs *args = (PrefetchCoArgs *)opaque;
     RAMBlock *block = qemu_ram_block_by_name("pc.ram");
+    LbaMapEntry *entries = g_lba_map_table.entries;
 
-    // 直接ホストメモリを触らず、一時的な「バウンスバッファ」を確保する
-    void *bounce_buf = g_malloc(TARGET_PAGE_SIZE);
+    // 直接ホストメモリを触らず、一時的な「バウンスバッファ」を確保する(まとめて読む最大の大きさ)
+    void *bounce_buf = g_malloc(TARGET_PAGE_SIZE * RESTORE_MAX_BATCH);
+    uint64_t page_idx[RESTORE_MAX_BATCH], ram_offset[RESTORE_MAX_BATCH];
+    bool already[RESTORE_MAX_BATCH];
 
-    for (uint32_t i = args->start_idx; i < args->end_idx; i++) {
-        uint64_t gpfn = g_lba_map_table.entries[i].gpfn;
-        uint64_t lba  = g_lba_map_table.entries[i].lba;
+    uint32_t i = args->start_idx;
+    while (i < args->end_idx) {
+        uint64_t lba = entries[i].lba;
+        if (lba == 0) {
+            i++;
+            continue;
+        }
 
-        if (lba > 0) {
-            uint64_t gpa = gpfn << TARGET_PAGE_BITS;
-            uint64_t ram_offset = (gpa >= 0x100000000ULL) ? (gpa - 0x40000000ULL) : gpa;
-            uint64_t page_idx = ram_offset >> TARGET_PAGE_BITS;
-            
-            // 1回目のチェック：既にネットワークから届いていればスキップ
-            if (g_mongo_page_received && g_mongo_page_received[page_idx]) {
+        // ディスク上で連続する行(LBA が 8 セクタ = 4KB ずつ続く行)を、最大 RESTORE_MAX_BATCH 行まとめる。
+        // メモリ側(GPFN)は連続していなくてよい(ページごとにコピー先を求める)
+        uint32_t n = 1;
+        while (i + n < args->end_idx && n < RESTORE_MAX_BATCH &&
+               entries[i + n].lba == lba + 8ULL * n) {
+            n++;
+        }
+
+        // 1回目のチェック：既にネットワークから届いているページを調べる。全部届いていれば読まない
+        uint32_t pending = 0;
+        for (uint32_t k = 0; k < n; k++) {
+            uint64_t gpa = entries[i + k].gpfn << TARGET_PAGE_BITS;
+            ram_offset[k] = (gpa >= 0x100000000ULL) ? (gpa - 0x40000000ULL) : gpa;
+            page_idx[k] = ram_offset[k] >> TARGET_PAGE_BITS;
+            already[k] = g_mongo_page_received && g_mongo_page_received[page_idx[k]];
+            if (already[k]) {
                 if (g_restore_outcome) {
-                    g_restore_outcome[i] = RESTORE_NET_BEFORE;
+                    g_restore_outcome[i + k] = RESTORE_NET_BEFORE;
                 }
-                continue;
-            }
-
-            // ホストメモリ(host_addr)ではなく、一時バッファ(bounce_buf)へ読み込む！
-            // 読み込んでいる最中は Yield され、ネットワーク受信処理が進む
-            int ret = blk_co_pread(args->blk, lba * 512, TARGET_PAGE_SIZE, bounce_buf, 0);
-
-            // 計測: ディスクから読んだ内容の CRC を記録する(書き込めたら下で結果を上書き)
-            if (g_restore_outcome) {
-                if (ret == 0) {
-                    g_restore_crc[i] = mongo_page_crc(bounce_buf);
-                    g_restore_outcome[i] = RESTORE_NET_DURING;
-                } else {
-                    g_restore_outcome[i] = RESTORE_READ_ERR;
-                }
-            }
-
-            // 2回目のチェック：ディスクから読み込んでいる間に、ネットワークから最新データが届かなかったか再確認する
-            if (ret == 0 && g_mongo_page_received && !g_mongo_page_received[page_idx]) {
-                // 🌟 状態 0 (初期) の場合のみ、状態 2 (memcpy中) へ遷移させる
-                if (__sync_bool_compare_and_swap(&g_mongo_page_received[page_idx], 0, 2)) {
-                    
-                    // 状態 2 を確保したので、ネットワーク受信と絶対に衝突しない！安全にコピー
-                    void *host_addr = block->host + ram_offset;
-                    memcpy(host_addr, bounce_buf, TARGET_PAGE_SIZE);
-                    
-                    // 🌟 コピーが終わったら状態 3 (ディスク完了) に変更し、ロックを解放する
-                    __sync_lock_test_and_set(&g_mongo_page_received[page_idx], 3);
-                    if (g_restore_outcome) {
-                        g_restore_outcome[i] = RESTORE_WRITTEN;
-                    }
-                }
-            }
-
-            if (ret < 0) {
-                fprintf(stderr, "[PREFETCH-WARN] blk_co_pread failed at LBA: %lu\n", (unsigned long)lba);
+            } else {
+                pending++;
             }
         }
+        if (pending == 0) {
+            i += n;
+            continue;
+        }
+
+        // まとめて1回で読む(読み込んでいる最中は Yield され、ネットワーク受信処理が進む)
+        int ret = blk_co_pread(args->blk, lba * 512, (int64_t)n * TARGET_PAGE_SIZE, bounce_buf, 0);
+        if (ret < 0) {
+            fprintf(stderr, "[PREFETCH-WARN] blk_co_pread failed at LBA: %lu (%u pages)\n",
+                    (unsigned long)lba, n);
+        }
+
+        // 読み込んだ n ページを、それぞれのメモリの位置へ書き込む(ディスクからは読み直さない)
+        for (uint32_t k = 0; k < n; k++) {
+            if (!already[k]) {
+                mongo_restore_one_page(block, i + k, page_idx[k], ram_offset[k],
+                                       (uint8_t *)bounce_buf + (size_t)k * TARGET_PAGE_SIZE, ret);
+            }
+        }
+        i += n;
     }
 
     // 一時バッファを解放

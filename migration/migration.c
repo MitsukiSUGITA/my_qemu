@@ -293,6 +293,11 @@ static int migration_stop_vm(MigrationState *s, RunState state)
     global_state_store();
 
     ret = vm_stop_force_state(state);
+    if (state == RUN_STATE_FINISH_MIGRATE) {
+        /* 計測: 移送元で、移送の最後に VM を止めた時刻。移送先の vm_resumed と合わせて、
+         * 実際に VM が止まっていた時間を出す(従来手法のビルドでも出す) */
+        fprintf(stderr, "[MIG-TIME] src_vm_stopped %.3f\n", g_get_real_time() / 1e6);
+    }
 
     trace_vmstate_downtime_checkpoint("src-vm-stopped");
     trace_migration_completion_vm_stop(ret);
@@ -849,8 +854,10 @@ static void process_incoming_migration_bh(void *opaque)
                 // 移送先VMの再開を検知し、MongoDBへフェーズ4（再開通知）のシグナルを送信
                 wait_for_mongo_migration_action(3);
                 fprintf(stderr, "[MIG-INFO] Target VM resumed.\n");
-                fprintf(stderr, "[MIG-TIME] vm_resumed %.3f\n", g_get_real_time() / 1e6); /* 診断用: 時系列の突き合わせ */
 #endif
+                /* 計測: 移送先で VM が動き出せるようになった時刻(従来手法のビルドでも出す)。
+                 * 提案手法では復元の完了待ちの後 */
+                fprintf(stderr, "[MIG-TIME] vm_resumed %.3f\n", g_get_real_time() / 1e6);
             }
         } else {
             runstate_set(RUN_STATE_PAUSED);

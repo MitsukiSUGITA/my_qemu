@@ -134,5 +134,9 @@ extern QemuSemaphore mongo_clear_sem;
 extern volatile int mongo_clear_status;
 // 実験用：MongoDBキャッシュクリア同期機能のON/OFFスイッチ
 // 1にすると同期処理を実行し、0にするとスキップ（対照実験用）
+/* 従来手法(素の QEMU)を別のフォルダにビルドするときは、configure の
+ * --extra-cflags に -DENABLE_MONGO_SYNC_EXPERIMENT=0 を足して切り替える */
+#ifndef ENABLE_MONGO_SYNC_EXPERIMENT
 #define ENABLE_MONGO_SYNC_EXPERIMENT 1
+#endif
 #endif
