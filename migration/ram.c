@@ -224,6 +224,8 @@ typedef struct {
 static LbaMapTable g_lba_map_table = {0, NULL};
 
 volatile uint8_t *g_mongo_page_received = NULL; // ネットワーク受信保護マップ
+static RAMBlock *g_mongo_ram_block = NULL;     // 状態の配列が表す RAMBlock (pc.ram)
+static uint64_t  g_mongo_page_count = 0;       // 状態の配列の要素数 = pc.ram のページ数
 volatile int g_prefetch_completed_count = 0;    // 完了したスレッド数
 #define PREFETCH_THREADS 16                     // 16並列でディスクを叩く
 
@@ -283,10 +285,12 @@ static uint64_t lookup_lba_by_ram_offset(RAMBlock *block, ram_addr_t offset)
 }
 */
 
-static void acquire_network_page_lock(ram_addr_t addr) {
-    if (!g_mongo_page_received) return;
-    
+static void acquire_network_page_lock(RAMBlock *block, ram_addr_t addr) {
+    // 状態の配列は pc.ram のページだけを表す(ほかの RAMBlock のページは対象外)
+    if (!g_mongo_page_received || block != g_mongo_ram_block) return;
+
     uint64_t page_idx = addr >> TARGET_PAGE_BITS;
+    if (page_idx >= g_mongo_page_count) return;
     uint8_t expected;
     
     // CPUのハードウェア命令を使ってアトミックに状態を遷移させる
@@ -5215,7 +5219,14 @@ static void mongo_prefetch_co_entry(void *opaque)
             uint64_t gpa = entries[i + k].gpfn << TARGET_PAGE_BITS;
             ram_offset[k] = (gpa >= 0x100000000ULL) ? (gpa - 0x40000000ULL) : gpa;
             page_idx[k] = ram_offset[k] >> TARGET_PAGE_BITS;
-            already[k] = g_mongo_page_received && g_mongo_page_received[page_idx[k]];
+            if (page_idx[k] >= g_mongo_page_count) {
+                // pc.ram の外を指す行(本来ありえない)は書き込まない
+                fprintf(stderr, "[PREFETCH-WARN] gpfn out of pc.ram: %" PRIu64 "\n",
+                        (uint64_t)entries[i + k].gpfn);
+                already[k] = true;
+                continue;
+            }
+            already[k] = g_mongo_page_received[page_idx[k]];
             if (already[k]) {
                 if (g_restore_outcome) {
                     g_restore_outcome[i + k] = RESTORE_NET_BEFORE;
@@ -5257,12 +5268,14 @@ static void mongo_prefetch_co_entry(void *opaque)
 // 🌟 2. メタデータ受信時 (Signal 1) に呼ばれる起動関数
 static void launch_mongo_prefetch_thread(void)
 {
-    // 保護マップの初期化 (4GBメモリなら1MBの配列で十分)
-    if(!g_mongo_page_received) {
-        g_mongo_page_received = g_malloc0(1048576);
-    } else {
-        memset((void*)g_mongo_page_received, 0, 1048576);
-    }
+    // 保護マップの初期化: pc.ram のページ数だけ確保する(4GiB なら 1MB、8GiB なら 2MB)
+    RAMBlock *ram = qemu_ram_block_by_name("pc.ram");
+    uint64_t pages = ram ? qemu_ram_get_used_length(ram) >> TARGET_PAGE_BITS : 0;
+    g_free((void *)g_mongo_page_received);
+    g_mongo_page_received = pages ? g_malloc0(pages) : NULL;
+    g_mongo_ram_block = ram;
+    g_mongo_page_count = pages;
+    fprintf(stderr, "[MIG-INFO] page state map: %" PRIu64 " pages\n", pages);
 
     // 計測: エントリごとの復元結果と CRC の記録場所(全て RESTORE_NOLBA / 0 で始まる)
     // 計測しないとき(既定)は記録場所を用意せず、復元のたびの CRC の計算もしない
@@ -5351,6 +5364,7 @@ static int ram_load_precopy(QEMUFile *f)
         ram_addr_t addr;
         void *host = NULL, *host_bak = NULL;
         uint8_t ch;
+        RAMBlock *mongo_block = NULL;   // 状態の配列の対象(pc.ram)かどうかの判定用
 
         /*
          * Yield periodically to let main loop run, but an iteration of
@@ -5384,6 +5398,7 @@ static int ram_load_precopy(QEMUFile *f)
                      RAM_SAVE_FLAG_XBZRLE | RAM_SAVE_FLAG_SKIPPED)) {
             RAMBlock *block = ram_block_from_stream(mis, f, flags,
                                                     RAM_CHANNEL_PRECOPY);
+            mongo_block = block;
 
             host = host_from_ram_block_offset(block, addr);
             /*
@@ -5444,18 +5459,14 @@ static int ram_load_precopy(QEMUFile *f)
                 break;
             }
             // 🌟 ゼロページ書き込み前にもロックを取得
-            acquire_network_page_lock(addr);
+            acquire_network_page_lock(mongo_block, addr);
             ram_handle_zero(host, TARGET_PAGE_SIZE);
             break;
 
         case RAM_SAVE_FLAG_PAGE:
             // 🌟 実データ書き込み前にロックを取得（これで memcpy との衝突が物理的に不可能になる）
-            acquire_network_page_lock(addr);
+            acquire_network_page_lock(mongo_block, addr);
             qemu_get_buffer(f, host, TARGET_PAGE_SIZE);
-            // 最新データをネットワークから受け取ったらフラグを立てる（上書き防止）
-            if (g_mongo_page_received) {
-                g_mongo_page_received[addr >> TARGET_PAGE_BITS] = 1;
-            }
             break;
 
         case RAM_SAVE_FLAG_XBZRLE:
